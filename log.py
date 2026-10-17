@@ -12,14 +12,14 @@ class Logger:
         self.run = None
         if track:
             self.run = wandb.init(project=project, name=name, config=asdict(cfg))
-        self.start = time.time()
+        self.start = time.perf_counter()
 
     def log(self, step: int, metrics: dict[str, float]):
         metrics = {k: float(np.asarray(v)) for k, v in metrics.items()}
         if self.run is not None:
             self.run.log(metrics, step=step)
         brief = {k: v for k, v in metrics.items() if not k.startswith("achievements/")}
-        print(f"[{time.time() - self.start:7.0f}s] step {step:,}  " + "  ".join(f"{k}={v:.4g}" for k, v in brief.items()), flush=True)
+        print(f"[{time.perf_counter() - self.start:7.0f}s] step {step:,}  " + "  ".join(f"{k}={v:.4g}" for k, v in brief.items()), flush=True)
 
     def close(self):
         if self.run is not None:
