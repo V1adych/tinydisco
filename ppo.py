@@ -19,7 +19,7 @@ class Config:
     env_name: str = "Craftax-Classic-Pixels-v1"
     seed: int = 0
     total_timesteps: int = 5_000_000_000
-    num_envs: int = 64
+    num_envs: int = 2048
     num_steps: int = 64  # rollout length, also the BPTT horizon
     # network
     embed_dim: int = 32
