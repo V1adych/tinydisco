@@ -210,7 +210,8 @@ def train(cfg: Config):
 
         if cfg.save_interval and (i % cfg.save_interval == 0 or i == cfg.num_updates):
             model, _, _ = nnx.merge(graphdef, state)
-            save_checkpoint(f"{cfg.checkpoint_dir}/{run_name}", i * steps_per_update, model)
+            path = save_checkpoint(f"{cfg.checkpoint_dir}/{run_name}", i * steps_per_update, model)
+            logger.upload_checkpoint(path, i * steps_per_update)
 
     logger.close()
     model, _, _ = nnx.merge(graphdef, state)

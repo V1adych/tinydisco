@@ -36,6 +36,7 @@ def save_checkpoint(directory: str, step: int, model: nnx.Module):
     path = os.path.abspath(os.path.join(directory, str(step)))
     with ocp.StandardCheckpointer() as ckptr:
         ckptr.save(path, nnx.state(model))
+    return path
 
 
 def load_checkpoint(path: str, model: nnx.Module):

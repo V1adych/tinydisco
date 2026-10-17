@@ -21,6 +21,13 @@ class Logger:
         brief = {k: v for k, v in metrics.items() if not k.startswith("achievements/")}
         print(f"[{time.perf_counter() - self.start:7.0f}s] step {step:,}  " + "  ".join(f"{k}={v:.4g}" for k, v in brief.items()), flush=True)
 
+    def upload_checkpoint(self, path: str, step: int):
+        """Uploads a saved checkpoint as a new version of the run's wandb artifact; the upload runs in the background."""
+        if self.run is not None:
+            artifact = wandb.Artifact(self.run.name, type="model")
+            artifact.add_dir(path)
+            self.run.log_artifact(artifact, aliases=[f"step-{step}"])
+
     def close(self):
         if self.run is not None:
             self.run.finish()
