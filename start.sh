@@ -29,6 +29,8 @@ fi
 
 python ppo.py --checkpoint_dir /workspace/checkpoints $TRAIN_ARGS
 
-# stop the pod so the GPU stops billing, even if training crashed
-runpodctl pod stop "$RUNPOD_POD_ID"
+# stop the pod so the GPU stops billing, even if training crashed.
+# RUNPOD_API_KEY is the pod's own key from RunPod; only the GraphQL API accepts it for this
+curl -s "https://api.runpod.io/graphql?api_key=$RUNPOD_API_KEY" -H "Content-Type: application/json" \
+    -d "{\"query\": \"mutation { podStop(input: {podId: \\\"$RUNPOD_POD_ID\\\"}) { id } }\"}"
 sleep infinity

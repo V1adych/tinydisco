@@ -1,12 +1,8 @@
 FROM nvidia/cuda:12.8.1-base-ubuntu24.04
 
-# sshd for logging into the pod, git for cloning the code, curl for fetching runpodctl
+# sshd for logging into the pod, git for cloning the code, curl for stopping the pod after training
 RUN apt-get update && apt-get install -y --no-install-recommends openssh-server git curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-
-# runpodctl lets the pod stop itself after training
-RUN curl -fsSL -o /usr/local/bin/runpodctl https://github.com/runpod/runpodctl/releases/download/v2.14.0/runpodctl-linux-amd64 \
-    && chmod +x /usr/local/bin/runpodctl
 
 # same uv as on the Mac
 COPY --from=ghcr.io/astral-sh/uv:0.13.0 /uv /usr/local/bin/uv
