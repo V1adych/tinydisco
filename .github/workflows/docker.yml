@@ -1,9 +1,9 @@
-# Builds the training image and pushes it to ghcr.io/v1adych/meta-rl on every push to main
 name: docker
 
 on:
   push:
     branches: [main]
+    paths: [Dockerfile, start.sh, pyproject.toml, uv.lock, .github/workflows/docker.yml]
   workflow_dispatch:
 
 jobs:
