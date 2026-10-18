@@ -27,7 +27,7 @@ if [ -z "$TRAIN_ARGS" ]; then
     sleep infinity
 fi
 
-python ppo.py --checkpoint_dir /workspace/checkpoints $TRAIN_ARGS
+python src/ppo.py --checkpoint_dir /workspace/checkpoints $TRAIN_ARGS
 
 # Delete the pod so nothing bills, even if training crashed: checkpoints and console output are already in wandb.
 # RUNPOD_API_KEY is the pod's own key from RunPod; only the GraphQL API accepts it for this
