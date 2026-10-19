@@ -11,7 +11,8 @@ from flax import nnx
 from jax import numpy as jnp
 
 from log import Logger
-from nn import ActorCriticRNN, num_params, save_checkpoint
+from checkpoint import save_checkpoint
+from nn import ActorCriticRNN, num_params
 
 
 @dataclass(frozen=True)

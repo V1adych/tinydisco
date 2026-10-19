@@ -1,8 +1,8 @@
-import os
+import math
 
 import jax
-import orbax.checkpoint as ocp
 from flax import nnx
+from jax import numpy as jnp
 
 
 class ActorCriticRNN(nnx.Module):
@@ -28,19 +28,73 @@ class ActorCriticRNN(nnx.Module):
         return carry, self.actor(x), self.critic(x).squeeze(-1)
 
 
+class FeedForward(nnx.Module):
+    """3x3 convs for (H, W, C) observations, then dense layers, then a linear output; flat observations skip the convs.
+    channels and hidden follow LPG's table 3, e.g. C(16)-D(32) is channels=(16,), hidden=(32,).
+    With neither, on a one-hot observation, this is a lookup table: LPG's tabular agent."""
+
+    def __init__(self, obs_shape: tuple[int, ...], num_outputs: int, channels: tuple[int, ...], hidden: tuple[int, ...], rngs: nnx.Rngs):
+        in_channels = [obs_shape[-1], *channels] if len(obs_shape) == 3 else []
+        self.convs = nnx.List([nnx.Conv(c_in, c_out, (3, 3), padding="SAME", rngs=rngs) for c_in, c_out in zip(in_channels, channels)])
+        size = math.prod(obs_shape[:-1]) * (channels[-1] if self.convs else obs_shape[-1])
+        sizes = [size, *hidden]
+        self.dense = nnx.List([nnx.Linear(a, b, rngs=rngs) for a, b in zip(sizes, hidden)])
+        self.out = nnx.Linear(sizes[-1], num_outputs, rngs=rngs)
+
+    def __call__(self, obs: jax.Array) -> jax.Array:
+        x = obs.astype(jnp.float32)
+        for conv in self.convs:
+            x = nnx.relu(conv(x))
+        x = x.reshape(*x.shape[: x.ndim - (3 if self.convs else 1)], -1)
+        for dense in self.dense:
+            x = nnx.relu(dense(x))
+        return self.out(x)
+
+
+class ActorCritic(nnx.Module):
+    """LPG's agent: an actor with policy logits and prediction logits y, whose updates come from the meta-network,
+    and a separate critic used only for the outer A2C loss; the meta-network never sees its value."""
+
+    def __init__(self, obs_shape: tuple[int, ...], num_actions: int, y_dim: int, channels: tuple[int, ...], hidden: tuple[int, ...], rngs: nnx.Rngs):
+        self.num_actions = num_actions
+        self.actor = FeedForward(obs_shape, num_actions + y_dim, channels, hidden, rngs)
+        self.critic = FeedForward(obs_shape, 1, channels, hidden, rngs)
+
+    def __call__(self, obs: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Returns policy logits, y logits and value."""
+        out = self.actor(obs)
+        return out[..., : self.num_actions], out[..., self.num_actions :], self.critic(obs).squeeze(-1)
+
+
+class MetaNetwork(nnx.Module):
+    """Learned Policy Gradient (Oh et al. 2020): a GRU unrolled backwards over a (T, B) trajectory turns rewards and
+    the agent's outputs into update targets: pi_hat, a scalar per step that scales grad log pi(a|s), and y_hat logits.
+    LPG used an LSTM; a GRU is the simpler equivalent. The paper's inputs: [r, terminated, gamma, pi(a|s), phi(y), phi(y_next)]."""
+
+    def __init__(self, y_dim: int, hidden_dim: int, rngs: nnx.Rngs):
+        self.hidden_dim = hidden_dim
+        # phi: the same small embedding squashes y(s) and y(s') to a scalar each
+        self.phi = nnx.Sequential(nnx.Linear(y_dim, 16, rngs=rngs), nnx.relu, nnx.Linear(16, 1, rngs=rngs))
+        self.gru = nnx.GRUCell(6, hidden_dim, rngs=rngs)
+        self.pi_hat = nnx.Linear(hidden_dim, 1, rngs=rngs)
+        self.y_hat = nnx.Linear(hidden_dim, y_dim, rngs=rngs)
+
+    def __call__(self, reward, terminated, boundary, gamma, prob, y, y_next) -> tuple[jax.Array, jax.Array]:
+        """reward, terminated, boundary (terminated | truncated), gamma and prob (pi of the taken action) are (T, B);
+        y and y_next are (T, B, y_dim) probabilities, y_next of the true next state, pre-reset. Returns pi_hat (T, B), y_hat logits (T, B, y_dim)."""
+        x = jnp.stack([reward, terminated, gamma, prob, self.phi(y)[..., 0], self.phi(y_next)[..., 0]], axis=-1).astype(jnp.float32)
+
+        def body(gru, h, x_t, boundary_t):
+            # the carry comes from step t+1, which is another episode when t ended one
+            h = jnp.where(boundary_t[:, None], 0.0, h)
+            h, out = gru(h, x_t)
+            return h, out
+
+        h = jnp.zeros((reward.shape[1], self.hidden_dim))
+        _, out = nnx.scan(body, in_axes=(None, nnx.Carry, 0, 0), out_axes=(nnx.Carry, 0), reverse=True)(self.gru, h, x, boundary)
+        out = out
+        return self.pi_hat(out)[..., 0], self.y_hat(out)
+
+
 def num_params(model: nnx.Module) -> int:
     return sum(x.size for x in jax.tree.leaves(nnx.state(model, nnx.Param)))
-
-
-def save_checkpoint(directory: str, step: int, model: nnx.Module):
-    path = os.path.abspath(os.path.join(directory, str(step)))
-    with ocp.StandardCheckpointer() as ckptr:
-        ckptr.save(path, nnx.state(model))
-    return path
-
-
-def load_checkpoint(path: str, model: nnx.Module):
-    """Restores params saved by save_checkpoint into an already constructed model."""
-    with ocp.StandardCheckpointer() as ckptr:
-        state = ckptr.restore(os.path.abspath(path), nnx.state(model))
-    nnx.update(model, state)
