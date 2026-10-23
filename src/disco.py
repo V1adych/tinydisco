@@ -250,7 +250,7 @@ def train(cfg: Config):
             metrics[block.name] = jax.tree.map(jnp.mean, block_metrics)
         grad = jax.tree.map(lambda *g: sum(g) / len(g), *grads)  # every environment weighs the same
         updates, meta_opt_state = meta_tx.update(grad, meta_opt_state, meta_params)
-        metrics["meta_grad_norm"] = optax.global_norm(grad)
+        metrics["meta_grad_norm"] = optax.tree.norm(grad)
         return optax.apply_updates(meta_params, updates), meta_opt_state, new_agents, stats, metrics
 
     add = jax.jit(lambda a, b: jax.tree.map(jnp.add, a, b))
