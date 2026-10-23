@@ -34,7 +34,8 @@ class FeedForward(nnx.Module):
     With neither, on a one-hot observation, this is a lookup table: LPG's tabular agent."""
 
     def __init__(self, obs_shape: tuple[int, ...], num_outputs: int, channels: tuple[int, ...], hidden: tuple[int, ...], rngs: nnx.Rngs):
-        in_channels = [obs_shape[-1], *channels] if len(obs_shape) == 3 else []
+        self.obs_ndim = len(obs_shape)
+        in_channels = [obs_shape[-1], *channels] if self.obs_ndim == 3 else []
         self.convs = nnx.List([nnx.Conv(c_in, c_out, (3, 3), padding="SAME", rngs=rngs) for c_in, c_out in zip(in_channels, channels)])
         size = math.prod(obs_shape[:-1]) * (channels[-1] if self.convs else obs_shape[-1])
         sizes = [size, *hidden]
@@ -45,7 +46,7 @@ class FeedForward(nnx.Module):
         x = obs.astype(jnp.float32)
         for conv in self.convs:
             x = nnx.relu(conv(x))
-        x = x.reshape(*x.shape[: x.ndim - (3 if self.convs else 1)], -1)
+        x = x.reshape(*x.shape[: -self.obs_ndim], -1)
         for dense in self.dense:
             x = nnx.relu(dense(x))
         return self.out(x)
@@ -84,15 +85,14 @@ class MetaNetwork(nnx.Module):
         y and y_next are (T, B, y_dim) probabilities, y_next of the true next state, pre-reset. Returns pi_hat (T, B), y_hat logits (T, B, y_dim)."""
         x = jnp.stack([reward, terminated, gamma, prob, self.phi(y)[..., 0], self.phi(y_next)[..., 0]], axis=-1).astype(jnp.float32)
 
-        def body(gru, h, x_t, boundary_t):
+        def body(h, inputs):
+            x_t, boundary_t = inputs
             # the carry comes from step t+1, which is another episode when t ended one
             h = jnp.where(boundary_t[:, None], 0.0, h)
-            h, out = gru(h, x_t)
-            return h, out
+            return self.gru(h, x_t)
 
-        h = jnp.zeros((reward.shape[1], self.hidden_dim))
-        _, out = nnx.scan(body, in_axes=(None, nnx.Carry, 0, 0), out_axes=(nnx.Carry, 0), reverse=True)(self.gru, h, x, boundary)
-        out = out
+        # a plain scan: nnx.scan rejects the cell's params when they are gradient tracers of the meta-gradient
+        _, out = jax.lax.scan(body, jnp.zeros((reward.shape[1], self.hidden_dim)), (x, boundary), reverse=True)
         return self.pi_hat(out)[..., 0], self.y_hat(out)
 
 

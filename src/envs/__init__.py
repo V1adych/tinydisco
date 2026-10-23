@@ -17,7 +17,8 @@ from .grid import GRIDS, GridWorld
 
 
 class CraftaxStep:
-    """A gymnax env with Craftax's step signature: done = terminated | truncated, the two kept apart in info."""
+    """A gymnax env with Craftax's step signature: done = terminated | truncated, the two kept apart in info,
+    with info["final_observation"] the observation before any auto-reset."""
 
     def __init__(self, env):
         self.env = env
@@ -27,8 +28,6 @@ class CraftaxStep:
 
     def step(self, key, state, action, params=None):
         obs, state, reward, terminated, truncated, info = self.env.step(key, state, action, params)
-        # the pre-reset observation, unused so far; drop it so per-key stat sums over info stay scalars
-        info.pop("final_observation")
         return obs, state, reward, terminated | truncated, info
 
 
