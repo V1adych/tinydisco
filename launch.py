@@ -1,3 +1,7 @@
+"""Starts a RunPod 4090 that runs the given command in the repo and deletes itself when it exits, e.g.
+    python launch.py python src/disco.py --track --checkpoint_dir /workspace/checkpoints
+Set CLOUD=SECURE when no community 4090 is in stock."""
+
 import json
 import os
 import sys
@@ -9,7 +13,7 @@ body = {
     "cloud": os.environ.get("CLOUD", "COMMUNITY"),
     "gpu": {"id": "NVIDIA GeForce RTX 4090", "count": 1, "minCudaVersion": "12.8"},
     "startSsh": True,
-    "env": {"TRAIN_ARGS": " ".join(sys.argv[1:])},
+    "env": {"RUN_COMMAND": " ".join(sys.argv[1:])},
 }
 request = urllib.request.Request(
     "https://api.runpod.io/v2/pods",

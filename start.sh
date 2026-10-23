@@ -22,12 +22,13 @@ cd /workspace/meta-rl
 # in case dependencies changed since the image was built; a no-op otherwise
 uv sync --frozen
 
-# Without TRAIN_ARGS the pod is a plain dev box
-if [ -z "$TRAIN_ARGS" ]; then
+# Without RUN_COMMAND the pod is a plain dev box
+if [ -z "$RUN_COMMAND" ]; then
     sleep infinity
 fi
 
-python src/ppo.py --checkpoint_dir /workspace/checkpoints $TRAIN_ARGS
+# e.g. python launch.py python src/disco.py --track --checkpoint_dir /workspace/checkpoints
+$RUN_COMMAND
 
 # Delete the pod so nothing bills, even if training crashed: checkpoints and console output are already in wandb.
 # RUNPOD_API_KEY is the pod's own key from RunPod; only the GraphQL API accepts it for this
