@@ -244,10 +244,11 @@ def train(cfg: Config):
             grad_fn = jax.vmap(jax.grad(partial(outer_loss, block, cfg, meta_graphdef), has_aux=True), in_axes=(None, 0, 0))
             grad, (agent, block_stats, block_metrics) = grad_fn(meta_params, agents[block.name], jax.random.split(key_outer, cfg.agents_per_env))
             agent, reset = jax.vmap(partial(end_of_lifetime, block, cfg))(agent, block_metrics["entropy"], jax.random.split(key_reset, cfg.agents_per_env))
-            grads.append(jax.tree.map(lambda g: g.mean(0), grad))
+            grad = jax.tree.map(lambda g: g.mean(0), grad)
+            grads.append(grad)
             new_agents[block.name] = agent
             stats[block.name] = jax.tree.map(jnp.sum, block_stats) | {"resets": reset.sum()}
-            metrics[block.name] = jax.tree.map(jnp.mean, block_metrics)
+            metrics[block.name] = jax.tree.map(jnp.mean, block_metrics) | {"meta_grad_norm": optax.tree.norm(grad)}
         grad = jax.tree.map(lambda *g: sum(g) / len(g), *grads)  # every environment weighs the same
         updates, meta_opt_state = meta_tx.update(grad, meta_opt_state, meta_params)
         metrics["meta_grad_norm"] = optax.tree.norm(grad)
