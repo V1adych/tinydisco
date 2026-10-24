@@ -17,7 +17,7 @@ import tyro
 from flax import nnx
 from jax import numpy as jnp
 
-from checkpoint import save_checkpoint
+from checkpoint import fetch_checkpoint, load_checkpoint, save_checkpoint
 from envs import make
 from log import Logger
 from nn import ActorCritic, MetaNetwork, num_params
@@ -79,6 +79,7 @@ class Config:
     log_interval: int = 10  # in meta steps
     save_interval: int = 1000  # in meta steps, 0 disables checkpoints
     checkpoint_dir: str = "checkpoints"
+    resume: str | None = None  # continue from a checkpoint directory or wandb artifact at its step; optimizer state and agents start fresh
     track: bool = False
     wandb_project: str = "meta-rl"
     run_name: str | None = None
@@ -230,7 +231,11 @@ def end_of_lifetime(block: Block, cfg: Config, agent: Agent, entropy, key: jax.A
 def train(cfg: Config):
     run_name = cfg.run_name or f"disco_s{cfg.seed}_{time.strftime('%Y%m%d-%H%M%S')}"
     blocks = [make_block(name, cfg) for name in cfg.envs]
-    meta_graphdef, meta_params = nnx.split(MetaNetwork(cfg.y_dim, cfg.meta_hidden, nnx.Rngs(cfg.seed)))
+    meta_network, start = MetaNetwork(cfg.y_dim, cfg.meta_hidden, nnx.Rngs(cfg.seed)), 0
+    if cfg.resume:
+        path, start = fetch_checkpoint(cfg.resume)
+        load_checkpoint(path, meta_network)
+    meta_graphdef, meta_params = nnx.split(meta_network)
     meta_tx = optax.chain(optax.clip_by_global_norm(cfg.max_grad_norm), optax.adam(cfg.meta_lr))
     meta_opt_state = meta_tx.init(meta_params)
     key = jax.random.key(cfg.seed)
@@ -259,8 +264,8 @@ def train(cfg: Config):
     steps_per_meta_step = len(blocks) * cfg.agents_per_env * cfg.num_envs * cfg.num_steps * (cfg.num_updates + 1)
     print(f"{run_name}: meta-network {num_params(nnx.merge(meta_graphdef, meta_params)):,} params, {len(blocks)} envs x {cfg.agents_per_env} agents, {steps_per_meta_step:,} env steps per meta step")
 
-    episode_stats, last_time, last_step = None, time.perf_counter(), 0
-    for i in range(1, cfg.meta_steps + 1):
+    episode_stats, last_time, last_step = None, time.perf_counter(), start
+    for i in range(start + 1, cfg.meta_steps + 1):
         meta_params, meta_opt_state, agents, stats, metrics = meta_step(meta_params, meta_opt_state, agents, jax.random.fold_in(key, i))
         episode_stats = stats if episode_stats is None else add(episode_stats, stats)
 

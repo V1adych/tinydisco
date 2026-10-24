@@ -1,5 +1,6 @@
 """Self-checks for disco.py: python src/test_disco.py"""
 
+import tempfile
 from dataclasses import replace
 
 import jax
@@ -30,7 +31,16 @@ def test_meta_steps_run():
     assert not all(jnp.allclose(b, a) for b, a in zip(before, after)), "the meta-network did not change"
 
 
+def test_resume_restores_meta_network():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = Config(envs=("Chain-short",), agents_per_env=2, num_envs=4, num_steps=5, num_updates=1, meta_steps=1, log_interval=1, save_interval=1, meta_hidden=8, checkpoint_dir=tmp, run_name="r")
+        trained = jax.tree.leaves(nnx.state(train(cfg)))
+        resumed = jax.tree.leaves(nnx.state(train(replace(cfg, meta_steps=0, resume=f"{tmp}/r/1"))))
+    assert all(jnp.array_equal(a, b) for a, b in zip(trained, resumed)), "resume did not restore the trained meta-network"
+
+
 if __name__ == "__main__":
     test_lambda_returns()
     test_meta_steps_run()
+    test_resume_restores_meta_network()
     print("ok")

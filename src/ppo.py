@@ -11,7 +11,7 @@ from flax import nnx
 from jax import numpy as jnp
 
 from log import Logger
-from checkpoint import save_checkpoint
+from checkpoint import fetch_checkpoint, load_checkpoint, save_checkpoint
 from nn import ActorCriticRNN, num_params
 
 
@@ -42,6 +42,7 @@ class Config:
     log_interval: int = 100  # in updates
     save_interval: int = 10_000  # in updates, 0 disables checkpoints
     checkpoint_dir: str = "checkpoints"
+    resume: str | None = None  # continue from a checkpoint directory or wandb artifact at its step; optimizer state starts fresh
     track: bool = False
     wandb_project: str = "meta-rl"
     run_name: str | None = None
@@ -168,8 +169,15 @@ def train(cfg: Config):
 
     rngs = nnx.Rngs(cfg.seed)
     model = ActorCriticRNN(env.observation_space(env_params).shape, env.action_space(env_params).n, cfg.embed_dim, cfg.hidden_dim, cfg.patch_size, rngs)
+    steps_per_update = cfg.num_envs * cfg.num_steps
+    start = 0
+    if cfg.resume:
+        path, step = fetch_checkpoint(cfg.resume)
+        load_checkpoint(path, model)
+        start = step // steps_per_update
     num_grad_steps = cfg.num_updates * cfg.update_epochs * cfg.num_minibatches
-    lr = optax.linear_schedule(cfg.lr, 0.0, num_grad_steps) if cfg.anneal_lr else cfg.lr
+    done_grad_steps = start * cfg.update_epochs * cfg.num_minibatches  # the anneal continues where the checkpoint left it
+    lr = (lambda count: optax.linear_schedule(cfg.lr, 0.0, num_grad_steps)(count + done_grad_steps)) if cfg.anneal_lr else cfg.lr
     tx = optax.chain(optax.clip_by_global_norm(cfg.max_grad_norm), optax.adamw(lr, weight_decay=cfg.weight_decay))
     optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
 
@@ -189,11 +197,10 @@ def train(cfg: Config):
     add = jax.jit(lambda a, b: jax.tree.map(jnp.add, a, b))
 
     logger = Logger(cfg, cfg.wandb_project, run_name, cfg.track)
-    steps_per_update = cfg.num_envs * cfg.num_steps
     print(f"{run_name}: {num_params(model):,} params, {cfg.num_updates:,} updates of {steps_per_update:,} steps")
 
-    episode_stats, last_time, last_update = None, time.perf_counter(), 0
-    for i in range(1, cfg.num_updates + 1):
+    episode_stats, last_time, last_update = None, time.perf_counter(), start
+    for i in range(start + 1, cfg.num_updates + 1):
         state, carry, metrics, stats = update_fn(state, carry)
         episode_stats = stats if episode_stats is None else add(episode_stats, stats)
 

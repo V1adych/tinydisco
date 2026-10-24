@@ -6,3 +6,4 @@ try_wandb.py
 .env
 .envrc
 .venv/
+artifacts/
