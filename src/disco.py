@@ -236,7 +236,9 @@ def train(cfg: Config):
         path, start = fetch_checkpoint(cfg.resume)
         load_checkpoint(path, meta_network)
     meta_graphdef, meta_params = nnx.split(meta_network)
-    meta_tx = optax.chain(optax.clip_by_global_norm(cfg.max_grad_norm), optax.adam(cfg.meta_lr))
+    meta_tx = optax.adam(cfg.meta_lr)
+    clip = optax.clip_by_global_norm(cfg.max_grad_norm)
+    clip_state = clip.init(meta_params)  # stateless, so one init serves every environment
     meta_opt_state = meta_tx.init(meta_params)
     key = jax.random.key(cfg.seed)
     agents = {block.name: jax.vmap(partial(init_agent, block, cfg))(jax.random.split(jax.random.fold_in(key, i), cfg.agents_per_env)) for i, block in enumerate(blocks)}
@@ -250,7 +252,7 @@ def train(cfg: Config):
             grad, (agent, block_stats, block_metrics) = grad_fn(meta_params, agents[block.name], jax.random.split(key_outer, cfg.agents_per_env))
             agent, reset = jax.vmap(partial(end_of_lifetime, block, cfg))(agent, block_metrics["entropy"], jax.random.split(key_reset, cfg.agents_per_env))
             grad = jax.tree.map(lambda g: g.mean(0), grad)
-            grads.append(grad)
+            grads.append(clip.update(grad, clip_state)[0])
             new_agents[block.name] = agent
             stats[block.name] = jax.tree.map(jnp.sum, block_stats) | {"resets": reset.sum()}
             metrics[block.name] = jax.tree.map(jnp.mean, block_metrics) | {"meta_grad_norm": optax.tree.norm(grad)}
