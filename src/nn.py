@@ -4,6 +4,8 @@ import jax
 from flax import nnx
 from jax import numpy as jnp
 
+ILLEGAL = -1e9  # logit of an action outside the game's legal set: no probability, and finite, so 0 * log 0 stays 0
+
 
 def to_float(obs: jax.Array) -> jax.Array:
     assert obs.dtype == jnp.uint8
@@ -60,10 +62,11 @@ class FeedForward(nnx.Module):
         return self.out(x.astype(jnp.float32))
 
 
-def agent_heads(out: jax.Array, num_actions: int, d: int) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Splits an agent's FeedForward output (A + D + A*D + A) into policy logits (A), y logits (D), z logits (A, D) and Q (A)."""
+def agent_heads(out: jax.Array, num_actions: int, d: int, valid: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Splits an agent's FeedForward output (A + D + A*D + A) into policy logits (A), y logits (D), z logits (A, D) and Q (A).
+    valid (A,) marks the game's legal actions; the policy gives the others none."""
     logits, y, z, q = jnp.split(out, [num_actions, num_actions + d, num_actions + d + num_actions * d], -1)
-    return logits, y, z.reshape(*z.shape[:-1], num_actions, d), q
+    return jnp.where(valid, logits, ILLEGAL), y, z.reshape(*z.shape[:-1], num_actions, d), q
 
 
 class RuleInputs(NamedTuple):
@@ -80,15 +83,17 @@ class RuleInputs(NamedTuple):
     v: jax.Array  # (T, N): sum_a pi Q
     v_next: jax.Array  # (T, N): v at t + 1
     adv: jax.Array  # (T, N): Retrace return minus v
+    valid: jax.Array  # (A,): the game's legal actions; the others pad the action axis to a size shared by all games
 
 
 def symlog(x: jax.Array) -> jax.Array:
     return jnp.sign(x) * jnp.log1p(jnp.abs(x))
 
 
-def normalize(x: jax.Array) -> jax.Array:
+def normalize(x: jax.Array, where: jax.Array | None = None) -> jax.Array:
+    """With the statistics of the entries where `where` holds (all by default)."""
     # shortcut: batch statistics, where DiscoRL keeps running averages; upgrade if small batches make them noisy
-    return (x - x.mean()) / (x.std() + 1e-6)
+    return (x - x.mean(where=where)) / (x.std(where=where) + 1e-6)
 
 
 def take(x: jax.Array, action: jax.Array) -> jax.Array:
@@ -103,8 +108,8 @@ class ActionMix(nnx.Module):
     def __init__(self, in_features: int, out_features: int, rngs: nnx.Rngs):
         self.linear = nnx.Linear(2 * in_features, out_features, rngs=rngs)
 
-    def __call__(self, x: jax.Array) -> jax.Array:  # (..., A, C)
-        mean = jnp.broadcast_to(x.mean(-2, keepdims=True), x.shape)
+    def __call__(self, x: jax.Array, valid: jax.Array) -> jax.Array:  # (..., A, C), valid (A,): the mean is over legal actions
+        mean = jnp.broadcast_to(x.mean(-2, keepdims=True, where=valid[:, None]), x.shape)
         return nnx.relu(self.linear(jnp.concatenate([x, mean], -1)))
 
 
@@ -132,10 +137,12 @@ class MetaNetwork(nnx.Module):
         pi = x.pi[:-1]
         y_emb = self.y_net(x.y).squeeze(-1)  # (T + 1, N)
         z_emb = self.z_net(x.z).squeeze(-1)  # (T + 1, N, A)
-        z_avg, z_max = (x.pi * z_emb).sum(-1), z_emb.max(-1)
+        z_avg, z_max = (x.pi * z_emb).sum(-1), jnp.where(x.valid, z_emb, -jnp.inf).max(-1)
         qv = x.q - x.v[..., None]
-        per_action = jnp.stack([pi, x.mu, z_emb[:-1], symlog(x.q), symlog(qv), normalize(qv), jax.nn.one_hot(x.action, num_actions)], -1)
-        action_emb = self.action_net(per_action)  # (T, N, A, 2)
+        per_action = jnp.stack([pi, x.mu, z_emb[:-1], symlog(x.q), symlog(qv), normalize(qv, jnp.broadcast_to(x.valid, qv.shape)), jax.nn.one_hot(x.action, num_actions)], -1)
+        action_emb = per_action
+        for layer in self.action_net.layers:
+            action_emb = layer(action_emb, x.valid)  # (T, N, A, 2)
         per_step = jnp.stack(
             [
                 take(pi, x.action),
@@ -156,7 +163,7 @@ class MetaNetwork(nnx.Module):
             ],
             -1,
         )
-        inputs = jnp.concatenate([per_step, action_emb.mean(-2), take(action_emb, x.action)], -1)
+        inputs = jnp.concatenate([per_step, action_emb.mean(-2, where=x.valid[:, None]), take(action_emb, x.action)], -1)
 
         def body(h, step):
             x_t, ended = step
@@ -167,8 +174,8 @@ class MetaNetwork(nnx.Module):
         # a plain scan: nnx.scan rejects the cell's params when they are gradient tracers of the meta-gradient
         _, h = jax.lax.scan(body, jnp.zeros((x.reward.shape[1], self.hidden_dim)), (inputs, x.discount == 0), reverse=True)
         per_action_h = jnp.concatenate([jnp.broadcast_to(h[:, :, None], (*h.shape[:2], num_actions, h.shape[-1])), action_emb], -1)
-        pi_hat = self.pi_hat(self.pi_mix(per_action_h)).squeeze(-1)
-        return pi_hat, self.y_hat(h), self.z_hat(h)
+        pi_hat = self.pi_hat(self.pi_mix(per_action_h, x.valid)).squeeze(-1)
+        return jnp.where(x.valid, pi_hat, ILLEGAL), self.y_hat(h), self.z_hat(h)
 
 
 def num_params(model: nnx.Module) -> int:

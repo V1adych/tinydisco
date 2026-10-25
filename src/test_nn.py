@@ -13,9 +13,11 @@ def test_agent_heads():
     obs, _ = jax.vmap(env.reset, in_axes=(0, None))(jax.random.split(jax.random.key(0), 5), params)
     num_actions, d = env.num_actions, 8
     agent = FeedForward(num_actions + d + num_actions * d + num_actions, nnx.Rngs(0))
-    logits, y, z, q = agent_heads(agent(obs), num_actions, d)
+    valid = jnp.arange(num_actions) < 2
+    logits, y, z, q = agent_heads(agent(obs), num_actions, d, valid)
     assert logits.shape == (5, num_actions) and y.shape == (5, d) and z.shape == (5, num_actions, d) and q.shape == (5, num_actions)
     assert logits.dtype == jnp.float32
+    assert (jax.nn.softmax(logits)[:, 2:] == 0).all(), "illegal actions must get no probability"
 
 
 def rule_inputs(reward):
@@ -30,7 +32,7 @@ def rule_inputs(reward):
     return RuleInputs(
         action=jax.random.randint(keys[2], (T, N), 0, A), reward=reward, discount=1.0 - boundary,
         pi=pi, mu=probs(keys[3], (T, N, A)), y=probs(keys[4], (T + 1, N, D)), z=probs(keys[5], (T + 1, N, A, D)),
-        q=q, v=v, v_next=jnp.roll(v, -1, 0), adv=jnp.zeros((T, N)),
+        q=q, v=v, v_next=jnp.roll(v, -1, 0), adv=jnp.zeros((T, N)), valid=jnp.ones(A, bool),
     )
 
 
@@ -53,12 +55,25 @@ def test_meta_serves_any_number_of_actions():
     net = MetaNetwork(6, 16, nnx.Rngs(0))
     x = rule_inputs(jnp.zeros((10, 3)))
     wider = x._replace(pi=jnp.concatenate([x.pi, x.pi], -1) / 2, mu=jnp.concatenate([x.mu, x.mu], -1) / 2,
-                       z=jnp.concatenate([x.z, x.z], -2), q=jnp.concatenate([x.q, x.q], -1))
+                       z=jnp.concatenate([x.z, x.z], -2), q=jnp.concatenate([x.q, x.q], -1), valid=jnp.ones(8, bool))
     assert net(wider)[0].shape == (10, 3, 8)
+
+
+def test_meta_ignores_padded_actions():
+    """Illegal padding actions, whatever their inputs, change none of the rule's outputs on the legal ones."""
+    net = MetaNetwork(6, 16, nnx.Rngs(0))
+    x = rule_inputs(jax.random.normal(jax.random.key(1), (10, 3)))
+    pad = lambda a, value: jnp.concatenate([a, jnp.full(a.shape[:-1] + (3,), value, a.dtype)], -1)
+    padded = x._replace(pi=pad(x.pi, 0.0), mu=pad(x.mu, 0.0), q=pad(x.q, 5.0), valid=pad(x.valid, False),
+                        z=jnp.concatenate([x.z, jnp.full(x.z.shape[:-2] + (3, x.z.shape[-1]), 0.5)], -2))
+    (pi_hat, y_hat, z_hat), (pi_pad, y_pad, z_pad) = net(x), net(padded)
+    assert jnp.allclose(pi_hat, pi_pad[..., :4], atol=1e-5) and jnp.allclose(y_hat, y_pad, atol=1e-5) and jnp.allclose(z_hat, z_pad, atol=1e-5)
+    assert (jax.nn.softmax(pi_pad)[..., 4:] == 0).all()
 
 
 if __name__ == "__main__":
     test_agent_heads()
     test_meta_looks_only_ahead_within_an_episode()
     test_meta_serves_any_number_of_actions()
+    test_meta_ignores_padded_actions()
     print("ok")

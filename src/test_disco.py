@@ -7,7 +7,8 @@ import jax
 from flax import nnx
 from jax import numpy as jnp
 
-from disco import Config, init_buffer, make_block, sample, store, train
+from disco import Config, init_buffer, make_nets, sample, store, train
+from envs import make
 
 TINY = Config(
     games=("breakout", "pong"), agents_per_game=2, num_envs=2, num_steps=3, num_updates=3, batch=4, buffer_size=30, valid_rollouts=1,
@@ -18,7 +19,7 @@ TINY = Config(
 def test_buffer_wraps_and_samples_the_new_rollout():
     """Rollouts overwrite the oldest trajectories, and a batch without replay holds only the rollout stored last."""
     cfg = replace(TINY, buffer_size=5 * TINY.num_steps, replay=0.0, batch=8)  # room for 5 trajectories, 2 per rollout
-    buffer = init_buffer(make_block("breakout", cfg), cfg)
+    buffer = init_buffer(make_nets(cfg, [make("Atari-breakout")[0]]), cfg)
     for k in range(3):  # rollout k into slots 2k and 2k + 1: rollout 2 into slots 4 and 0, over rollout 0's first
         rollout = jax.tree.map(lambda x: x[:, : cfg.num_envs], buffer.data)._replace(reward=jnp.full((cfg.num_steps, cfg.num_envs), k, jnp.float32))
         buffer = store(buffer, rollout)
