@@ -28,7 +28,7 @@ def rule_inputs(reward):
     q = jax.random.normal(keys[1], (T, N, A))
     v = (pi[:-1] * q).sum(-1)
     return RuleInputs(
-        action=jax.random.randint(keys[2], (T, N), 0, A), reward=reward, discount=1.0 - boundary, boundary=boundary,
+        action=jax.random.randint(keys[2], (T, N), 0, A), reward=reward, discount=1.0 - boundary,
         pi=pi, mu=probs(keys[3], (T, N, A)), y=probs(keys[4], (T + 1, N, D)), z=probs(keys[5], (T + 1, N, A, D)),
         q=q, v=v, v_next=jnp.roll(v, -1, 0), adv=jnp.zeros((T, N)),
     )

@@ -37,7 +37,8 @@ class ActorCriticRNN(nnx.Module):
 
 class FeedForward(nnx.Module):
     """The DQN torso (Mnih et al. 2015) on (84, 84, 4) uint8 frames, then a linear output. The torso computes in bf16
-    with float32 weights; the output layer is float32, since the losses on it are softmaxes and KLs."""
+    with float32 weights; the output layer is float32, since the losses on it are softmaxes and KLs. The output starts
+    near zero (weights of stddev 0.01, as DiscoRL's heads): uniform policies and predictions, zero values."""
 
     def __init__(self, num_outputs: int, rngs: nnx.Rngs):
         bf16 = dict(dtype=jnp.bfloat16, param_dtype=jnp.float32, rngs=rngs)
@@ -49,7 +50,7 @@ class FeedForward(nnx.Module):
             ]
         )
         self.dense = nnx.Linear(7 * 7 * 64, 512, **bf16)
-        self.out = nnx.Linear(512, num_outputs, rngs=rngs)
+        self.out = nnx.Linear(512, num_outputs, kernel_init=nnx.initializers.normal(1e-2), rngs=rngs)
 
     def __call__(self, obs: jax.Array) -> jax.Array:
         x = to_float(obs)
@@ -70,15 +71,14 @@ class RuleInputs(NamedTuple):
 
     action: jax.Array  # (T, N)
     reward: jax.Array  # (T, N)
-    discount: jax.Array  # (T, N): 0 where the episode terminated, else 1
-    boundary: jax.Array  # (T, N): the episode ended at t (terminated or truncated), so t + 1 is another one
+    discount: jax.Array  # (T, N): 0 where the episode ended, so t + 1 starts another one, else 1
     pi: jax.Array  # (T + 1, N, A): the agent's policy
     mu: jax.Array  # (T, N, A): the behaviour policy that acted
     y: jax.Array  # (T + 1, N, D) probabilities
     z: jax.Array  # (T + 1, N, A, D) probabilities
     q: jax.Array  # (T, N, A)
     v: jax.Array  # (T, N): sum_a pi Q
-    v_next: jax.Array  # (T, N): the value step t bootstraps from (pre-reset when truncated)
+    v_next: jax.Array  # (T, N): v at t + 1
     adv: jax.Array  # (T, N): Retrace return minus v
 
 
@@ -159,13 +159,13 @@ class MetaNetwork(nnx.Module):
         inputs = jnp.concatenate([per_step, action_emb.mean(-2), take(action_emb, x.action)], -1)
 
         def body(h, step):
-            x_t, boundary_t = step
+            x_t, ended = step
             # the carry comes from step t+1, which is another episode when t ended one
-            h = jnp.where(boundary_t[:, None], 0.0, h)
+            h = jnp.where(ended[:, None], 0.0, h)
             return self.gru(h, x_t)
 
         # a plain scan: nnx.scan rejects the cell's params when they are gradient tracers of the meta-gradient
-        _, h = jax.lax.scan(body, jnp.zeros((x.reward.shape[1], self.hidden_dim)), (inputs, x.boundary), reverse=True)
+        _, h = jax.lax.scan(body, jnp.zeros((x.reward.shape[1], self.hidden_dim)), (inputs, x.discount == 0), reverse=True)
         per_action_h = jnp.concatenate([jnp.broadcast_to(h[:, :, None], (*h.shape[:2], num_actions, h.shape[-1])), action_emb], -1)
         pi_hat = self.pi_hat(self.pi_mix(per_action_h)).squeeze(-1)
         return pi_hat, self.y_hat(h), self.z_hat(h)

@@ -7,32 +7,26 @@ import jax
 from flax import nnx
 from jax import numpy as jnp
 
-from disco import Config, retrace, train, vtrace
+from disco import Config, init_buffer, make_block, sample, store, train
 
-# a 3-step rollout, gamma 0.5, whose episode ends at step 1; on-policy with full traces both estimators are Monte Carlo
-REWARD = jnp.array([[1.0], [2.0], [3.0]])
-VALUE = jnp.array([[5.0], [6.0], [7.0]])  # V(s_t), and Q(s_t, a_t) for Retrace
-VALUE_NEXT = jnp.array([[6.0], [99.0], [30.0]])  # step 1's is the pre-reset state, other steps' the next stored one
-BOUNDARY = jnp.array([[False], [True], [False]])
-ONES = jnp.ones_like(REWARD)
+TINY = Config(
+    games=("breakout", "pong"), agents_per_game=2, num_envs=2, num_steps=3, num_updates=3, batch=4, buffer_size=30, valid_rollouts=1,
+    lifetimes=(100, 1000), d=4, meta_hidden=8, meta_steps=2, log_interval=1, save_interval=0,
+)
 
 
-def test_off_policy_returns():
-    terminated = 0.5 * (1 - BOUNDARY)
-    truncated = 0.5 * ONES
-    # terminated at step 1: no bootstrap there; the last step bootstraps from its next value
-    expected = jnp.array([[2.0], [2.0], [18.0]])
-    assert jnp.allclose(retrace(VALUE, VALUE_NEXT, REWARD, terminated, BOUNDARY, ONES), expected)
-    assert jnp.allclose(vtrace(VALUE, VALUE_NEXT, REWARD, terminated, BOUNDARY, ONES, 1.0)[0], expected)
-    # truncated at step 1: it bootstraps from the pre-reset state, and step 0's trace runs through it
-    expected = jnp.array([[26.75], [51.5], [18.0]])
-    assert jnp.allclose(retrace(VALUE, VALUE_NEXT, REWARD, truncated, BOUNDARY, ONES), expected)
-    assert jnp.allclose(vtrace(VALUE, VALUE_NEXT, REWARD, truncated, BOUNDARY, ONES, 1.0)[0], expected)
-    # zero traces: one-step targets
-    assert jnp.allclose(retrace(VALUE, VALUE_NEXT, REWARD, truncated, BOUNDARY, 0 * ONES), REWARD + 0.5 * VALUE_NEXT)
-
-
-TINY = Config(games=("breakout", "pong"), agents_per_game=2, num_envs=2, num_steps=3, num_updates=2, d=4, meta_hidden=8, meta_steps=2, log_interval=1, save_interval=0)
+def test_buffer_wraps_and_samples_the_new_rollout():
+    """Rollouts overwrite the oldest trajectories, and a batch without replay holds only the rollout stored last."""
+    cfg = replace(TINY, buffer_size=5 * TINY.num_steps, replay=0.0, batch=8)  # room for 5 trajectories, 2 per rollout
+    buffer = init_buffer(make_block("breakout", cfg), cfg)
+    for k in range(3):  # rollout k into slots 2k and 2k + 1: rollout 2 into slots 4 and 0, over rollout 0's first
+        rollout = jax.tree.map(lambda x: x[:, : cfg.num_envs], buffer.data)._replace(reward=jnp.full((cfg.num_steps, cfg.num_envs), k, jnp.float32))
+        buffer = store(buffer, rollout)
+    assert buffer.size == 5 and buffer.idx == 1
+    assert jnp.array_equal(buffer.data.reward[0], jnp.array([2, 0, 1, 1, 2], jnp.float32))
+    batch = sample(cfg, buffer, jax.random.key(0))
+    assert batch.obs.shape[:2] == (cfg.num_steps + 1, 8) and batch.reward.shape == (cfg.num_steps, 8)
+    assert (batch.reward == 2).all(), "the new share must come from the rollout stored last"
 
 
 def test_meta_steps_run():
@@ -52,7 +46,7 @@ def test_resume_restores_meta_network():
 
 
 if __name__ == "__main__":
-    test_off_policy_returns()
+    test_buffer_wraps_and_samples_the_new_rollout()
     test_meta_steps_run()
     test_resume_restores_meta_network()
     print("ok")
