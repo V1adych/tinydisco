@@ -71,8 +71,34 @@ def test_random_rollouts():
         assert done.any() or name.startswith("Craftax"), f"{name}: no episode ended in {num_steps} steps"
 
 
+def test_atari_keeps_the_final_observation():
+    """When an episode ends, info holds its last stack and obs is a reset stack (one frame repeated)."""
+    env, params = make("Atari-breakout")
+    num_envs = 8
+
+    @jax.jit
+    def run(key):
+        obs, state = jax.vmap(env.reset, in_axes=(0, None))(jax.random.split(key, num_envs), params)
+
+        def body(carry, key):
+            state, obs = carry
+            action = jax.random.randint(key, (num_envs,), 0, env.num_actions)
+            next_obs, state, _, done, info = jax.vmap(env.step, in_axes=(0, 0, 0, None))(jax.random.split(key, num_envs), state, action, params)
+            return (state, next_obs), (obs, next_obs, done, info)
+
+        _, out = jax.lax.scan(body, (state, obs), jax.random.split(key, 300))
+        return out
+
+    obs, next_obs, done, info = run(jax.random.key(0))
+    assert done.any(), "no breakout episode ended in 300 random steps"
+    assert (info["final_observation"][..., :-1] == obs[..., 1:]).all()
+    assert (next_obs[done][..., :-1] == next_obs[done][..., 1:]).all()
+    assert (info["score"][~done] == 0).all() and (info["score"][done] >= 0).all()
+
+
 if __name__ == "__main__":
     test_chain_pays_for_the_first_action()
     test_grid_collects()
     test_random_rollouts()
+    test_atari_keeps_the_final_observation()
     print("ok")

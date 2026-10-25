@@ -27,6 +27,8 @@ ssh-keyscan github.com >> ~/.ssh/known_hosts 2> /dev/null
 git clone git@github.com:V1adych/meta-rl.git /root/meta-rl
 cd /root/meta-rl
 uv sync --frozen
+# jaxtari's sprite pack; the owner confirmed owning the Atari 2600 ROMs
+JAXTARI_CONFIRM_OWNERSHIP=1 uv run install-sprites
 env >> /etc/environment  # so that an ssh session sees the same variables as this script
 
 # Without RUN_COMMAND the instance is a plain dev box that stays up

@@ -5,6 +5,11 @@ from flax import nnx
 from jax import numpy as jnp
 
 
+def to_float(obs: jax.Array) -> jax.Array:
+    assert obs.dtype == jnp.uint8
+    return obs / 255
+
+
 class ActorCriticRNN(nnx.Module):
     """Patch-conv encoder -> GRU -> policy logits, y logits (LPG's predictions, empty for PPO) and value."""
 
@@ -23,7 +28,7 @@ class ActorCriticRNN(nnx.Module):
         return self.rnn.initialize_carry((batch_size, self.hidden_dim), rngs=nnx.Rngs(0))
 
     def __call__(self, carry: jax.Array, obs: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-        x = nnx.relu(self.encoder(obs))
+        x = nnx.relu(self.encoder(to_float(obs)))
         x = nnx.relu(self.proj(x.reshape(*x.shape[:-3], -1)))
         carry, x = self.rnn(carry, x)
         out = self.actor(x)
@@ -45,7 +50,7 @@ class FeedForward(nnx.Module):
         self.out = nnx.Linear(sizes[-1], num_outputs, rngs=rngs)
 
     def __call__(self, obs: jax.Array) -> jax.Array:
-        x = obs.astype(jnp.float32)
+        x = to_float(obs)
         for conv in self.convs:
             x = nnx.relu(conv(x))
         x = x.reshape(*x.shape[: -self.obs_ndim], -1)
