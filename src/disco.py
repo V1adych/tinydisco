@@ -328,21 +328,32 @@ def train(cfg: Config):
     # under jit, so that leaves that are the same array (atari's obs and its state's frame stack) get buffers of their own for donation
     agents = {block.name: jax.jit(jax.vmap(partial(init_agent, block, cfg)))(jax.random.split(jax.random.fold_in(key, i), cfg.agents_per_game)) for i, block in enumerate(blocks)}
 
-    @partial(jax.jit, donate_argnums=(0, 1, 2))
+    @partial(jax.jit, static_argnums=0, donate_argnums=(2, 3))
+    def game_step(i, meta_params, agents, meta_opt_state, key):
+        """Game i's agents: their meta-gradients through their Adams, summed, and the agents after the meta step."""
+        block = blocks[i]
+        key_meta, key_reset = jax.random.split(key)
+        grad_fn = jax.vmap(jax.grad(partial(outer_loss, block, cfg, meta_graphdef), has_aux=True), in_axes=(None, 0, 0))
+        grad, (agents, metrics, stats) = grad_fn(meta_params, agents, jax.random.split(key_meta, cfg.agents_per_game))
+        agents, reset = jax.vmap(partial(end_of_lifetime, block, cfg))(agents, jax.random.split(key_reset, cfg.agents_per_game))
+        updates, meta_opt_state = jax.vmap(meta_tx.update, in_axes=(0, 0, None))(grad, meta_opt_state, meta_params)
+        stats = jax.tree.map(jnp.sum, stats) | {"resets": reset.sum()}
+        metrics = jax.tree.map(jnp.mean, metrics) | {"meta_grad_norm": jax.vmap(optax.tree.norm)(grad).mean()}
+        return jax.tree.map(lambda u: u.sum(0), updates), agents, meta_opt_state, stats, metrics
+
+    @partial(jax.jit, donate_argnums=0)
+    def apply_updates(meta_params, update_sum):
+        """The mean of all agents' Adam steps."""
+        return optax.apply_updates(meta_params, jax.tree.map(lambda u: u / (len(blocks) * cfg.agents_per_game), update_sum))
+
     def meta_step(meta_params, meta_opt_state, agents, key):
-        update_sum, new_opt_state, new_agents, stats, metrics = jax.tree.map(jnp.zeros_like, meta_params), {}, {}, {}, {}
+        update_sum, stats, metrics = None, {}, {}
         for i, block in enumerate(blocks):
-            key_meta, key_reset = jax.random.split(jax.random.fold_in(key, i))
-            grad_fn = jax.vmap(jax.grad(partial(outer_loss, block, cfg, meta_graphdef), has_aux=True), in_axes=(None, 0, 0))
-            grad, (agent, block_metrics, block_stats) = grad_fn(meta_params, agents[block.name], jax.random.split(key_meta, cfg.agents_per_game))
-            agent, reset = jax.vmap(partial(end_of_lifetime, block, cfg))(agent, jax.random.split(key_reset, cfg.agents_per_game))
-            updates, new_opt_state[block.name] = jax.vmap(meta_tx.update, in_axes=(0, 0, None))(grad, meta_opt_state[block.name], meta_params)
-            update_sum = jax.tree.map(lambda s, u: s + u.sum(0), update_sum, updates)
-            new_agents[block.name] = agent
-            stats[block.name] = jax.tree.map(jnp.sum, block_stats) | {"resets": reset.sum()}
-            metrics[block.name] = jax.tree.map(jnp.mean, block_metrics) | {"meta_grad_norm": jax.vmap(optax.tree.norm)(grad).mean()}
-        updates = jax.tree.map(lambda u: u / (len(blocks) * cfg.agents_per_game), update_sum)
-        return optax.apply_updates(meta_params, updates), new_opt_state, new_agents, stats, metrics
+            updates, agents[block.name], meta_opt_state[block.name], stats[block.name], metrics[block.name] = game_step(
+                i, meta_params, agents[block.name], meta_opt_state[block.name], jax.random.fold_in(key, i)
+            )
+            update_sum = updates if update_sum is None else add(update_sum, updates)
+        return apply_updates(meta_params, update_sum), meta_opt_state, agents, stats, metrics
 
     add = jax.jit(lambda a, b: jax.tree.map(jnp.add, a, b))
     steps_per_meta_step = len(blocks) * cfg.agents_per_game * cfg.num_envs * cfg.num_steps * (cfg.num_updates + cfg.valid_rollouts)
