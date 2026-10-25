@@ -1,27 +1,3 @@
-"""Meta-trains an update rule (nn.MetaNetwork) after DiscoRL (Oh et al. 2025) on a population of agents playing Atari
-games, at nanodisco's scale: python src/disco.py [--games breakout pong ...] [--track]
-
-Every agent update is as in DiscoRL's evaluation: the agent's num_envs x num_steps new steps go into its replay buffer,
-then it learns towards the meta-network's targets on a batch of trajectories, a replay share of them from the buffer.
-A meta step backpropagates through num_updates such updates; the inner gradient's backward pass is a Hessian-vector
-product by forward-over-reverse (utils.mixflow_grad), and each update is recomputed in the meta-backward from its
-inputs (jax.checkpoint), so it stores only its parameters, optimiser state and batch. The updated agent is then scored
-on validation rollouts by a policy gradient with V-trace advantages from a separate critic. Each agent's meta-gradient
-goes through its own clipped Adam and the steps are averaged. Agents live on between meta steps until their lifetime,
-drawn with probability proportional to 1 / lifetime, ends.
-
-As in DiscoRL's meta-training colab, a meta step first collects all of its rollouts, for the updates and for
-validation, with the agents' parameters from its start (one program per game, since the games' code differs), then
-learns from them in one program batched over all agents: the agents of every game share one network whose action axis
-is padded to the most actions any game has, with the game's legal actions marked (nn.agent_heads, nn.RuleInputs.valid).
-Off-policy corrections (Retrace, V-trace) account for the policy changing over the meta step, as for replay.
-
-Left out of DiscoRL, as nanodisco does: the target network and its outputs among the rule's inputs, the agent's
-next-policy prediction (its action model), the per-lifetime meta-RNN, running statistics for normalisation (batch
-statistics instead) and the categorical Q head (a scalar one with a squared loss). An episode truncated by its time
-limit (108k frames) ends like a terminated one, without a bootstrap, as in DiscoRL's environments.
-"""
-
 import time
 from dataclasses import dataclass
 from functools import partial
@@ -54,6 +30,7 @@ class Config:
     # shortcut: whole frame stacks are stored (28 KB per step), so the buffer is small; store single frames if it must grow
     buffer_size: int = 10_000  # transitions per agent
     valid_rollouts: int = 6  # rollouts that score the updated agent: 6 x 8 = 48 trajectories, as DiscoRL
+    group: int = 4  # agents whose meta-gradients are computed at once: memory holds this many backward passes
     lifetimes: tuple[int, ...] = (1_000_000, 2_500_000, 5_000_000, 10_000_000)  # env steps; DiscoRL's ratios at 1/20 scale
     meta_steps: int = 20_000
     seed: int = 0
@@ -279,7 +256,6 @@ def agent_update(nets: Nets, cfg: Config, meta_graphdef, meta_params, agent: Age
     rollout, key = xs
     buffer = store(agent.buffer, rollout)
     batch = sample(cfg, buffer, key)
-    # the meta-backward recomputes the update from its inputs rather than storing what its passes made (nanodisco's REMAT)
     params, opt_state, logits, reg, pi_hat_entropy = jax.checkpoint(partial(learn, nets, cfg, meta_graphdef))(
         meta_params, agent.params, agent.opt_state, batch, agent.valid
     )
@@ -361,7 +337,9 @@ def train(cfg: Config):
     valid = jnp.repeat(jnp.stack([jnp.arange(nets.num_actions) < game.num_actions for game in games]), per_game, 0)
     agents = jax.jit(jax.vmap(partial(init_agent, nets, cfg)))(valid, jax.random.split(key, num_agents))
     # under jit, so that leaves that are the same array (atari's obs and its state's frame stack) get buffers of their own for donation
-    envs = [jax.jit(jax.vmap(partial(init_envs, game, cfg)))(jax.random.split(jax.random.fold_in(key, g + 1), per_game)) for g, game in enumerate(games)]
+    envs = [
+        jax.jit(jax.vmap(partial(init_envs, game, cfg)))(jax.random.split(jax.random.fold_in(key, g + 1), per_game)) for g, game in enumerate(games)
+    ]
     reset = jnp.zeros(num_agents, bool)
 
     @partial(jax.jit, static_argnums=0, donate_argnums=3)
@@ -373,11 +351,11 @@ def train(cfg: Config):
 
     @partial(jax.jit, donate_argnums=(0, 1, 2))
     def meta_step(meta_params, meta_opt_state, agents, rollouts, key):
-        """Every agent's meta-gradient from its rollouts, all batched; the mean of their Adam steps; the agents after it."""
         rollouts = jax.tree.map(lambda *x: jnp.concatenate(x), *rollouts)
         key_meta, key_reset = jax.random.split(key)
-        grad_fn = jax.vmap(jax.grad(partial(outer_loss, nets, cfg, meta_graphdef), has_aux=True), in_axes=(None, 0, 0, 0))
-        grad, (agents, metrics) = grad_fn(meta_params, agents, rollouts, jax.random.split(key_meta, num_agents))
+        grad_fn = jax.grad(partial(outer_loss, nets, cfg, meta_graphdef), has_aux=True)
+        xs = (agents, rollouts, jax.random.split(key_meta, num_agents))
+        grad, (agents, metrics) = jax.lax.map(lambda x: grad_fn(meta_params, *x), xs, batch_size=cfg.group)
         agents, reset = jax.vmap(partial(end_of_lifetime, nets, cfg))(agents, jax.random.split(key_reset, num_agents))
         updates, meta_opt_state = jax.vmap(meta_tx.update, in_axes=(0, 0, None))(grad, meta_opt_state, meta_params)
         meta_params = optax.apply_updates(meta_params, jax.tree.map(lambda u: u.mean(0), updates))
@@ -385,7 +363,9 @@ def train(cfg: Config):
 
     add = jax.jit(lambda a, b: jax.tree.map(jnp.add, a, b))
     steps_per_meta_step = num_agents * cfg.num_envs * cfg.num_steps * (cfg.num_updates + cfg.valid_rollouts)
-    print(f"{run_name}: meta-network {num_params(nnx.merge(meta_graphdef, meta_params)):,} params, {len(games)} games x {per_game} agents, {steps_per_meta_step:,} env steps per meta step")
+    print(
+        f"{run_name}: meta-network {num_params(nnx.merge(meta_graphdef, meta_params)):,} params, {len(games)} games x {per_game} agents, {steps_per_meta_step:,} env steps per meta step"
+    )
 
     totals, last_time, last_step = None, time.perf_counter(), start
     for i in range(start + 1, cfg.meta_steps + 1):
@@ -407,7 +387,11 @@ def train(cfg: Config):
                 agents_of_game = slice(g * per_game, (g + 1) * per_game)
                 log |= {f"{name}/{k}": np.mean(v[agents_of_game]) for k, v in metrics.items()}
                 s = stats[g]
-                log |= {f"{name}/score": s["score"] / max(s["episodes"], 1), f"{name}/episodes": s["episodes"], f"{name}/resets": resets[agents_of_game].sum()}
+                log |= {
+                    f"{name}/score": s["score"] / max(s["episodes"], 1),
+                    f"{name}/episodes": s["episodes"],
+                    f"{name}/resets": resets[agents_of_game].sum(),
+                }
             logger.log(i, log, console=["sps", *(f"{name}/score" for name in cfg.games)])
             totals, last_time, last_step = None, now, i
 
