@@ -22,6 +22,7 @@ VAST_OFFER_FILTER = {
     "inet_down": {"gte": 500},
     "disk_space": {"gte": 40},
     "cpu_cores_effective": {"gte": 8},
+    "duration": {"gte": 24 * 60 * 60},
     "type": "on-demand",
     "order": [["dph_total", "asc"]],
     "limit": 8,

@@ -230,6 +230,7 @@ def end_of_lifetime(block: Block, cfg: Config, agent: Agent, entropy, key: jax.A
 
 def train(cfg: Config):
     run_name = cfg.run_name or f"disco_s{cfg.seed}_{time.strftime('%Y%m%d-%H%M%S')}"
+    logger = Logger(cfg, cfg.wandb_project, run_name, cfg.track)  # first, so that wandb records the console of a crash during setup
     blocks = [make_block(name, cfg) for name in cfg.envs]
     meta_network, start = MetaNetwork(cfg.y_dim, cfg.meta_hidden, nnx.Rngs(cfg.seed)), 0
     if cfg.resume:
@@ -262,7 +263,6 @@ def train(cfg: Config):
         return optax.apply_updates(meta_params, updates), meta_opt_state, new_agents, stats, metrics
 
     add = jax.jit(lambda a, b: jax.tree.map(jnp.add, a, b))
-    logger = Logger(cfg, cfg.wandb_project, run_name, cfg.track)
     steps_per_meta_step = len(blocks) * cfg.agents_per_env * cfg.num_envs * cfg.num_steps * (cfg.num_updates + 1)
     print(f"{run_name}: meta-network {num_params(nnx.merge(meta_graphdef, meta_params)):,} params, {len(blocks)} envs x {cfg.agents_per_env} agents, {steps_per_meta_step:,} env steps per meta step")
 

@@ -70,7 +70,7 @@ class StepCarry(NamedTuple):
 
 
 def step(env, env_params, model, carry: StepCarry, rngs: nnx.Rngs) -> tuple[tuple[Transition, dict], StepCarry]:
-    rnn_state, logits, value = model(carry.rnn_state, carry.last_obs)
+    rnn_state, logits, _, value = model(carry.rnn_state, carry.last_obs)
     action = jax.random.categorical(rngs.next_key(), logits)
     log_prob = jnp.take_along_axis(jax.nn.log_softmax(logits), action[..., None], axis=-1).squeeze(-1)
     obs, env_state, reward, done, info = jax.vmap(env.step, in_axes=(0, 0, 0, None))(jax.random.split(rngs.next_key(), action.shape[0]), carry.env_state, action, env_params)
@@ -104,20 +104,21 @@ def compute_gae(transitions: Transition, last_value: jax.Array, cfg: Config) -> 
     return advantages, advantages + transitions.value
 
 
-def unroll(model, rnn_state: jax.Array, obs: jax.Array, done: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """Replays (T, B, ...) sequences from the rnn state at the start of the rollout, resetting it exactly as step() does."""
+def unroll(model, rnn_state: jax.Array, obs: jax.Array, done: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Replays (T, B, ...) sequences from the rnn state at the start of the rollout, resetting it exactly as step() does.
+    Returns policy logits, y logits and values."""
 
     def body(model, rnn_state, obs_t, done_t):
-        rnn_state, logits, value = model(rnn_state, obs_t)
+        rnn_state, logits, y_logits, value = model(rnn_state, obs_t)
         rnn_state = jnp.where(done_t[:, None], 0.0, rnn_state)
-        return rnn_state, (logits, value)
+        return rnn_state, (logits, y_logits, value)
 
-    _, (logits, value) = nnx.scan(body, in_axes=(None, nnx.Carry, 0, 0), out_axes=(nnx.Carry, 0))(model, rnn_state, obs, done)
-    return logits, value
+    _, out = nnx.scan(body, in_axes=(None, nnx.Carry, 0, 0), out_axes=(nnx.Carry, 0))(model, rnn_state, obs, done)
+    return out
 
 
 def ppo_loss(model, rnn_state, batch: Transition, advantages, targets, cfg: Config):
-    logits, value = unroll(model, rnn_state, batch.obs, batch.done)
+    logits, _, value = unroll(model, rnn_state, batch.obs, batch.done)
     log_probs = jax.nn.log_softmax(logits)
     log_prob = jnp.take_along_axis(log_probs, batch.action[..., None], axis=-1).squeeze(-1)
     log_ratio = log_prob - batch.log_prob
@@ -142,7 +143,7 @@ def update(env, env_params, model, optimizer: nnx.Optimizer, carry: StepCarry, c
     """One PPO iteration: collect a rollout, then update_epochs passes over minibatches of whole env sequences."""
     init_rnn_state = carry.rnn_state
     transitions, stats, carry = collect_rollouts(env, env_params, model, carry, cfg, rngs)
-    _, _, last_value = model(carry.rnn_state, carry.last_obs)
+    _, _, _, last_value = model(carry.rnn_state, carry.last_obs)
     advantages, targets = compute_gae(transitions, last_value, cfg)
 
     # (update_epochs * num_minibatches, envs_per_minibatch) env indices, a fresh permutation per epoch
@@ -164,6 +165,7 @@ def update(env, env_params, model, optimizer: nnx.Optimizer, carry: StepCarry, c
 def train(cfg: Config):
     assert cfg.num_envs % cfg.num_minibatches == 0, "num_minibatches must divide num_envs"
     run_name = cfg.run_name or f"ppo_{cfg.env_name}_s{cfg.seed}_{time.strftime('%Y%m%d-%H%M%S')}"
+    logger = Logger(cfg, cfg.wandb_project, run_name, cfg.track)  # first, so that wandb records the console of a crash during setup
     env = make_craftax_env_from_name(cfg.env_name, auto_reset=True)
     env_params = env.default_params
 
@@ -195,8 +197,6 @@ def train(cfg: Config):
         return nnx.state((model, optimizer, rngs)), carry, metrics, stats
 
     add = jax.jit(lambda a, b: jax.tree.map(jnp.add, a, b))
-
-    logger = Logger(cfg, cfg.wandb_project, run_name, cfg.track)
     print(f"{run_name}: {num_params(model):,} params, {cfg.num_updates:,} updates of {steps_per_update:,} steps")
 
     episode_stats, last_time, last_update = None, time.perf_counter(), start
