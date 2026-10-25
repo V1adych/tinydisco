@@ -1,5 +1,3 @@
-import math
-
 import jax
 from flax import nnx
 from jax import numpy as jnp
@@ -36,27 +34,25 @@ class ActorCriticRNN(nnx.Module):
 
 
 class FeedForward(nnx.Module):
-    """3x3 convs for (H, W, C) observations, then dense layers, then a linear output; flat observations skip the convs.
-    channels and hidden follow LPG's table 3, e.g. C(16)-D(32) is channels=(16,), hidden=(32,).
-    With neither, on a one-hot observation, this is a lookup table: LPG's tabular agent."""
+    """The DQN torso (Mnih et al. 2015) on (84, 84, 4) uint8 frames, then a linear output. The torso computes in bf16
+    with float32 weights; the output layer is float32, since the losses on it are softmaxes and KLs."""
 
-    def __init__(self, obs_shape: tuple[int, ...], num_outputs: int, channels: tuple[int, ...], hidden: tuple[int, ...], rngs: nnx.Rngs):
-        self.obs_ndim = len(obs_shape)
-        in_channels = [obs_shape[-1], *channels] if self.obs_ndim == 3 else []
-        self.convs = nnx.List([nnx.Conv(c_in, c_out, (3, 3), padding="SAME", rngs=rngs) for c_in, c_out in zip(in_channels, channels)])
-        size = math.prod(obs_shape[:-1]) * (channels[-1] if self.convs else obs_shape[-1])
-        sizes = [size, *hidden]
-        self.dense = nnx.List([nnx.Linear(a, b, rngs=rngs) for a, b in zip(sizes, hidden)])
-        self.out = nnx.Linear(sizes[-1], num_outputs, rngs=rngs)
+    def __init__(self, num_outputs: int, rngs: nnx.Rngs):
+        bf16 = dict(dtype=jnp.bfloat16, param_dtype=jnp.float32, rngs=rngs)
+        self.convs = nnx.List([
+            nnx.Conv(4, 32, (8, 8), strides=4, padding="VALID", **bf16),  # -> 20x20
+            nnx.Conv(32, 64, (4, 4), strides=2, padding="VALID", **bf16),  # -> 9x9
+            nnx.Conv(64, 64, (3, 3), strides=1, padding="VALID", **bf16),  # -> 7x7
+        ])
+        self.dense = nnx.Linear(7 * 7 * 64, 512, **bf16)
+        self.out = nnx.Linear(512, num_outputs, rngs=rngs)
 
     def __call__(self, obs: jax.Array) -> jax.Array:
         x = to_float(obs)
         for conv in self.convs:
             x = nnx.relu(conv(x))
-        x = x.reshape(*x.shape[: -self.obs_ndim], -1)
-        for dense in self.dense:
-            x = nnx.relu(dense(x))
-        return self.out(x)
+        x = nnx.relu(self.dense(x.reshape(*x.shape[:-3], -1)))
+        return self.out(x.astype(jnp.float32))
 
 
 class ActorCritic(nnx.Module):
