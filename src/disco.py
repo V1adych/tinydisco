@@ -30,7 +30,9 @@ class Config:
     # shortcut: whole frame stacks are stored (28 KB per step), so the buffer is small; store single frames if it must grow
     buffer_size: int = 10_000  # transitions per agent
     valid_rollouts: int = 6  # rollouts that score the updated agent: 6 x 8 = 48 trajectories, as DiscoRL
-    group: int = 4  # agents whose meta-gradients are computed at once: memory holds this many backward passes
+    # memory against speed, with the same results: how much is computed at once
+    agent_chunk: int = 4  # agents whose meta-gradients are computed at once: memory holds this many backward passes
+    time_chunk: int = 10  # time steps of a rollout per pass of a network over it; >= num_steps + 1 is all at once
     lifetimes: tuple[int, ...] = (1_000_000, 2_500_000, 5_000_000, 10_000_000)  # env steps; DiscoRL's ratios at 1/20 scale
     meta_steps: int = 20_000
     seed: int = 0
@@ -111,11 +113,18 @@ class Envs(NamedTuple):
     obs: jax.Array
 
 
+def apply(graphdef, params, obs: jax.Array, cfg: Config) -> jax.Array:
+    """A network on time-major (T, N, ...) observations, time_chunk steps at a time (nanodisco's CNN_STEPS). Each chunk is
+    recomputed in the backward pass instead of stored, so only one chunk's activations are alive at once."""
+    net = jax.checkpoint(lambda params, obs: nnx.merge(graphdef, params)(obs))
+    return jax.lax.map(lambda obs: net(params, obs), obs, batch_size=cfg.time_chunk)
+
+
 def inner_loss(graphdef, num_actions: int, cfg: Config, params, targets, data: tuple[Rollout, jax.Array]) -> jax.Array:
     """The agent's loss on a batch: KL to the rule's pi, y and z targets, and a Retrace TD loss for its Q head."""
     pi_hat, y_hat, z_hat, returns = targets
     batch, valid = data
-    logits, y, z, q = agent_heads(nnx.merge(graphdef, params)(batch.obs[:-1]), num_actions, cfg.d, valid)
+    logits, y, z, q = agent_heads(apply(graphdef, params, batch.obs[:-1], cfg), num_actions, cfg.d, valid)
     loss = kl(pi_hat, logits) + kl(y_hat, y) + kl(z_hat, take(z, batch.action)) + cfg.q_cost * (returns - take(q, batch.action)) ** 2
     return loss.mean()
 
@@ -236,9 +245,8 @@ def rule_inputs(cfg: Config, out, traj: Rollout, valid: jax.Array) -> tuple[Rule
 def learn(nets: Nets, cfg: Config, meta_graphdef, meta_params, params, opt_state, batch: Rollout, valid: jax.Array):
     """One agent update towards the meta-network's targets on a batch. Also returns the policy before it (constant) and
     the meta-objective's regulariser on the targets."""
-    # recomputed in the meta-backward instead of stored: y and z carry the meta-gradient back to the params, through this pass
-    forward = jax.checkpoint(lambda params: agent_heads(nnx.merge(nets.graphdef, params)(batch.obs), nets.num_actions, cfg.d, valid))
-    out = forward(params)
+    # y and z carry the meta-gradient back to the params, through this pass
+    out = agent_heads(apply(nets.graphdef, params, batch.obs, cfg), nets.num_actions, cfg.d, valid)
     inputs, returns = rule_inputs(cfg, out, batch, valid)
     pi_hat, y_hat, z_hat = nnx.merge(meta_graphdef, meta_params)(inputs)
     grads = nets.inner_grad(params, (pi_hat, y_hat, z_hat, returns), (batch, valid))
@@ -264,7 +272,7 @@ def agent_update(nets: Nets, cfg: Config, meta_graphdef, meta_params, agent: Age
     rho = take(jax.nn.softmax(logits), batch.action) / take(batch.mu, batch.action)
 
     def critic_loss_fn(critic_params):
-        values = nnx.merge(nets.critic_graphdef, critic_params)(batch.obs).squeeze(-1)
+        values = apply(nets.critic_graphdef, critic_params, batch.obs, cfg).squeeze(-1)
         targets, _ = vtrace(jax.lax.stop_gradient(values), batch.reward, cfg.gamma * ~batch.done, rho, cfg.lam)
         return 0.5 * ((targets - values[:-1]) ** 2).mean()
 
@@ -290,9 +298,9 @@ def outer_loss(nets: Nets, cfg: Config, meta_graphdef, meta_params, agent: Agent
 
     # (rollouts, T, N, ...) -> (T, rollouts * N, ...)
     valid = jax.tree.map(lambda x: jnp.moveaxis(x[cfg.num_updates :], 0, 1).reshape(x.shape[1], -1, *x.shape[3:]), rollouts)
-    out = agent_heads(nnx.merge(nets.graphdef, agent.params)(valid.obs), nets.num_actions, cfg.d, agent.valid)
+    out = agent_heads(apply(nets.graphdef, agent.params, valid.obs, cfg), nets.num_actions, cfg.d, agent.valid)
     logits, y, z, _ = jax.tree.map(lambda x: x[:-1], out)
-    values = nnx.merge(nets.critic_graphdef, agent.critic)(valid.obs).squeeze(-1)
+    values = apply(nets.critic_graphdef, agent.critic, valid.obs, cfg).squeeze(-1)
     rho = jax.lax.stop_gradient(take(jax.nn.softmax(logits), valid.action) / take(valid.mu, valid.action))
     _, advantage = vtrace(values, valid.reward, cfg.gamma * ~valid.done, rho, cfg.lam)
     # normalised per agent, so that games with large values don't dominate the meta-gradient
@@ -355,7 +363,7 @@ def train(cfg: Config):
         key_meta, key_reset = jax.random.split(key)
         grad_fn = jax.grad(partial(outer_loss, nets, cfg, meta_graphdef), has_aux=True)
         xs = (agents, rollouts, jax.random.split(key_meta, num_agents))
-        grad, (agents, metrics) = jax.lax.map(lambda x: grad_fn(meta_params, *x), xs, batch_size=cfg.group)
+        grad, (agents, metrics) = jax.lax.map(lambda x: grad_fn(meta_params, *x), xs, batch_size=cfg.agent_chunk)
         agents, reset = jax.vmap(partial(end_of_lifetime, nets, cfg))(agents, jax.random.split(key_reset, num_agents))
         updates, meta_opt_state = jax.vmap(meta_tx.update, in_axes=(0, 0, None))(grad, meta_opt_state, meta_params)
         meta_params = optax.apply_updates(meta_params, jax.tree.map(lambda u: u.mean(0), updates))

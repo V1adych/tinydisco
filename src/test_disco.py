@@ -4,10 +4,11 @@ import tempfile
 from dataclasses import replace
 
 import jax
+import optax
 from flax import nnx
 from jax import numpy as jnp
 
-from disco import Config, init_buffer, make_nets, sample, store, train
+from disco import Config, apply, init_buffer, make_nets, sample, store, train
 from envs import make
 
 TINY = Config(
@@ -38,6 +39,24 @@ def test_meta_steps_run():
     assert not all(jnp.allclose(b, a) for b, a in zip(before, after)), "the meta-network did not change"
 
 
+def test_time_chunk_keeps_values_and_derivatives():
+    """apply in chunks of time steps gives what one pass gives, in its outputs, its gradient and the forward-over-reverse
+    pass of MixFlow-MG, up to bf16 rounding. (Whole training runs can't be compared: Adam's first step is about
+    lr * sign(gradient), which turns rounding noise in near-zero gradients into whole steps.)"""
+    nets = make_nets(TINY, [make("Atari-breakout")[0]])
+    _, params = nnx.split(nets.new_agent(rngs=nnx.Rngs(0)))
+    obs = jax.random.randint(jax.random.key(0), (7, 3, 84, 84, 4), 0, 256).astype(jnp.uint8)
+    probe = jax.tree.map(lambda p: jax.random.normal(jax.random.key(1), p.shape), params)
+
+    def derivatives(time_chunk):
+        loss = lambda params: (apply(nets.graphdef, params, obs, replace(TINY, time_chunk=time_chunk)) ** 2).mean()
+        hvp = jax.jvp(jax.grad(loss), (params,), (probe,))[1]
+        return apply(nets.graphdef, params, obs, replace(TINY, time_chunk=time_chunk)), jax.grad(loss)(params), hvp
+
+    for chunked, whole in zip(derivatives(3), derivatives(99)):
+        assert optax.tree.norm(jax.tree.map(jnp.subtract, chunked, whole)) < 1e-2 * optax.tree.norm(whole), "chunking changed a result"
+
+
 def test_resume_restores_meta_network():
     with tempfile.TemporaryDirectory() as tmp:
         cfg = replace(TINY, games=("breakout",), meta_steps=1, save_interval=1, checkpoint_dir=tmp, run_name="r")
@@ -49,5 +68,6 @@ def test_resume_restores_meta_network():
 if __name__ == "__main__":
     test_buffer_wraps_and_samples_the_new_rollout()
     test_meta_steps_run()
+    test_time_chunk_keeps_values_and_derivatives()
     test_resume_restores_meta_network()
     print("ok")
