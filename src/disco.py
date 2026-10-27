@@ -94,15 +94,14 @@ class Buffer(NamedTuple):
 
 
 class Agent(NamedTuple):
-    """One learner: its network, critic, optimisers, replay buffer, its game's legal actions, age and lifetime in env
-    steps. Its envs are kept apart (Envs), as their state differs between games. In train these carry a leading axis
-    over agents."""
+    """One learner: its network, critic, optimisers, its game's legal actions, age and lifetime in env steps. Its envs
+    (Envs) and replay buffer (Buffer) are kept apart: the envs' state differs between games, and the buffer must not
+    pass through the meta-gradient's map, which would copy it. In train these carry a leading axis over agents."""
 
     params: Any
     opt_state: Any
     critic: Any
     critic_opt_state: Any
-    buffer: Buffer
     valid: jax.Array  # (A,)
     age: jax.Array
     lifetime: jax.Array
@@ -167,7 +166,7 @@ def init_agent(nets: Nets, cfg: Config, valid: jax.Array, key: jax.Array) -> Age
     lifetime = draw_lifetime(cfg, key_lifetime)
     # lifetimes start staggered so the population always spans young and old agents
     age = jax.random.randint(key_age, (), 0, lifetime)
-    return Agent(params, nets.agent_tx.init(params), critic, nets.critic_tx.init(critic), init_buffer(nets, cfg), valid, age, lifetime)
+    return Agent(params, nets.agent_tx.init(params), critic, nets.critic_tx.init(critic), valid, age, lifetime)
 
 
 def init_envs(env, cfg: Config, key: jax.Array) -> Envs:
@@ -216,15 +215,18 @@ def store(buffer: Buffer, rollout: Rollout) -> Buffer:
     return Buffer(data, (buffer.idx + n) % capacity, jnp.minimum(capacity, buffer.size + n))
 
 
-def sample(cfg: Config, buffer: Buffer, key: jax.Array) -> Rollout:
-    """A batch of stored trajectories: a replay share of them from anywhere in the buffer, the rest from the num_envs
-    stored last, the new rollout."""
+def sample(cfg: Config, buffer: Buffer, k: jax.Array, key: jax.Array) -> tuple[Rollout, jax.Array]:
+    """Update k's batch from a buffer that already holds the meta step's num_updates rollouts: a replay share from the
+    trajectories stored up to rollout k, the rest from rollout k; and whether those are at least a batch."""
     key_old, key_new, key_mix = jax.random.split(key, 3)
     capacity = buffer.data.action.shape[1]
-    old = jax.random.randint(key_old, (cfg.batch,), 0, buffer.size)
-    new = (buffer.idx - jax.random.randint(key_new, (cfg.batch,), 1, cfg.num_envs + 1)) % capacity
-    i = jnp.where(jax.random.bernoulli(key_mix, cfg.replay, (cfg.batch,)), old, new)
-    return jax.tree.map(lambda x: x[:, i], buffer.data)
+    later = (cfg.num_updates - 1 - k) * cfg.num_envs  # trajectories of the rollouts after k, stored last
+    # shortcut: when the buffer is full, the oldest `later` trajectories are left out though they were there at update k
+    stored = buffer.size - later
+    old = buffer.idx - later - 1 - jax.random.randint(key_old, (cfg.batch,), 0, stored)
+    new = buffer.idx - later - jax.random.randint(key_new, (cfg.batch,), 1, cfg.num_envs + 1)
+    i = jnp.where(jax.random.bernoulli(key_mix, cfg.replay, (cfg.batch,)), old, new) % capacity
+    return jax.tree.map(lambda x: x[:, i], buffer.data), stored >= cfg.batch
 
 
 def rule_inputs(cfg: Config, out, traj: Rollout, valid: jax.Array) -> tuple[RuleInputs, jax.Array]:
@@ -258,12 +260,10 @@ def learn(nets: Nets, cfg: Config, meta_graphdef, meta_params, params, opt_state
     return optax.apply_updates(params, updates), opt_state, logits, reg, entropy(pi_hat).mean()
 
 
-def agent_update(nets: Nets, cfg: Config, meta_graphdef, meta_params, agent: Agent, xs: tuple[Rollout, jax.Array]):
-    """Stores a rollout in the buffer, then, once the buffer holds a batch, one agent update on a sampled batch and one
-    critic update."""
-    rollout, key = xs
-    buffer = store(agent.buffer, rollout)
-    batch = sample(cfg, buffer, key)
+def agent_update(nets: Nets, cfg: Config, meta_graphdef, meta_params, buffer: Buffer, agent: Agent, xs: tuple[jax.Array, jax.Array]):
+    """Update k: once the buffer holds a batch, one agent update on a sampled batch and one critic update."""
+    k, key = xs
+    batch, ready = sample(cfg, buffer, k, key)
     params, opt_state, logits, reg, pi_hat_entropy = jax.checkpoint(partial(learn, nets, cfg, meta_graphdef))(
         meta_params, agent.params, agent.opt_state, batch, agent.valid
     )
@@ -280,21 +280,20 @@ def agent_update(nets: Nets, cfg: Config, meta_graphdef, meta_params, agent: Age
     critic_updates, critic_opt_state = nets.critic_tx.update(jax.grad(critic_loss_fn)(critic), agent.critic_opt_state, critic)
 
     # learning starts once the buffer holds one batch, as in DiscoRL's evaluation
-    ready = buffer.size >= cfg.batch
     new = (params, opt_state, optax.apply_updates(critic, critic_updates), critic_opt_state)
     old = (agent.params, agent.opt_state, agent.critic, agent.critic_opt_state)
     params, opt_state, critic, critic_opt_state = jax.tree.map(lambda n, o: jnp.where(ready, n, o), new, old)
-    agent = agent._replace(params=params, opt_state=opt_state, critic=critic, critic_opt_state=critic_opt_state, buffer=buffer)
+    agent = agent._replace(params=params, opt_state=opt_state, critic=critic, critic_opt_state=critic_opt_state)
     metrics = {"pi_hat_entropy": pi_hat_entropy, "rho": jnp.minimum(rho, 1.0).mean(), "ready": ready}
     return agent, (ready * reg, metrics)
 
 
-def outer_loss(nets: Nets, cfg: Config, meta_graphdef, meta_params, agent: Agent, rollouts: Rollout, key: jax.Array):
-    """The meta-objective for one agent: num_updates updates by the meta-network on its first rollouts, then a policy
-    gradient of the updated agent on the rest, with V-trace advantages and DiscoRL's regularisers."""
-    train = jax.tree.map(lambda x: x[: cfg.num_updates], rollouts)
-    update = partial(agent_update, nets, cfg, meta_graphdef, meta_params)
-    agent, (reg, metrics) = jax.lax.scan(update, agent, (train, jax.random.split(key, cfg.num_updates)))
+def outer_loss(nets: Nets, cfg: Config, meta_graphdef, meta_params, agent: Agent, buffer: Buffer, rollouts: Rollout, key: jax.Array):
+    """The meta-objective for one agent: num_updates updates by the meta-network on its first rollouts (stored in the
+    buffer already), then a policy gradient of the updated agent on the rest, with V-trace advantages and DiscoRL's
+    regularisers."""
+    update = partial(agent_update, nets, cfg, meta_graphdef, meta_params, buffer)
+    agent, (reg, metrics) = jax.lax.scan(update, agent, (jnp.arange(cfg.num_updates), jax.random.split(key, cfg.num_updates)))
 
     # (rollouts, T, N, ...) -> (T, rollouts * N, ...)
     valid = jax.tree.map(lambda x: jnp.moveaxis(x[cfg.num_updates :], 0, 1).reshape(x.shape[1], -1, *x.shape[3:]), rollouts)
@@ -318,11 +317,11 @@ def outer_loss(nets: Nets, cfg: Config, meta_graphdef, meta_params, agent: Agent
 
 
 def end_of_lifetime(nets: Nets, cfg: Config, agent: Agent, key: jax.Array) -> tuple[Agent, jax.Array]:
-    """Ages the agent by the meta step and starts a new lifetime when its own is over; its envs restart at the next collect."""
+    """Ages the agent by the meta step and starts a new lifetime when its own is over; its envs restart at the next
+    collect, and the caller empties its buffer."""
     age = agent.age + (cfg.num_updates + cfg.valid_rollouts) * cfg.num_steps * cfg.num_envs
     reset = age >= agent.lifetime
-    # the new agent empties the old buffer rather than allocating one: its stale trajectories are never sampled
-    fresh = init_agent(nets, cfg, agent.valid, key)._replace(age=jnp.int32(0), buffer=agent.buffer._replace(idx=jnp.int32(0), size=jnp.int32(0)))
+    fresh = init_agent(nets, cfg, agent.valid, key)._replace(age=jnp.int32(0))
     return jax.tree.map(lambda f, a: jnp.where(reset, f, a), fresh, agent._replace(age=age)), reset
 
 
@@ -332,6 +331,7 @@ def train(cfg: Config):
     games = [make(f"Atari-{game}")[0] for game in cfg.games]
     nets = make_nets(cfg, games)
     num_agents, per_game = len(games) * cfg.agents_per_game, cfg.agents_per_game
+    assert cfg.buffer_size // cfg.num_steps >= cfg.num_updates * cfg.num_envs, "a meta step's rollouts must fit in the buffer at once"
     meta_network, start = MetaNetwork(cfg.d, cfg.meta_hidden, nnx.Rngs(cfg.seed)), 0
     if cfg.resume:
         path, start = fetch_checkpoint(cfg.resume)
@@ -344,6 +344,7 @@ def train(cfg: Config):
     # agent k plays game k // agents_per_game
     valid = jnp.repeat(jnp.stack([jnp.arange(nets.num_actions) < game.num_actions for game in games]), per_game, 0)
     agents = jax.jit(jax.vmap(partial(init_agent, nets, cfg)))(valid, jax.random.split(key, num_agents))
+    buffers = jax.jit(jax.vmap(lambda _: init_buffer(nets, cfg)))(jnp.arange(num_agents))
     # under jit, so that leaves that are the same array (atari's obs and its state's frame stack) get buffers of their own for donation
     envs = [
         jax.jit(jax.vmap(partial(init_envs, game, cfg)))(jax.random.split(jax.random.fold_in(key, g + 1), per_game)) for g, game in enumerate(games)
@@ -357,17 +358,22 @@ def train(cfg: Config):
         rollouts, stats, envs = jax.vmap(partial(collect, nets, cfg, games[g]))(params, valid, envs, reset, jax.random.split(key, per_game))
         return rollouts, jax.tree.map(jnp.sum, stats), envs
 
-    @partial(jax.jit, donate_argnums=(0, 1, 2))
-    def meta_step(meta_params, meta_opt_state, agents, rollouts, key):
+    @partial(jax.jit, donate_argnums=(0, 1, 2, 3))
+    def meta_step(meta_params, meta_opt_state, agents, buffers, rollouts, key):
         rollouts = jax.tree.map(lambda *x: jnp.concatenate(x), *rollouts)
+        # the training rollouts go into the buffers first, in place; (rollouts, T, N, ...) -> (T, rollouts * N, ...)
+        train = jax.tree.map(lambda x: jnp.moveaxis(x[:, : cfg.num_updates], 1, 2).reshape(x.shape[0], x.shape[2], -1, *x.shape[4:]), rollouts)
+        buffers = jax.vmap(store)(buffers, train)
         key_meta, key_reset = jax.random.split(key)
         grad_fn = jax.grad(partial(outer_loss, nets, cfg, meta_graphdef), has_aux=True)
-        xs = (agents, rollouts, jax.random.split(key_meta, num_agents))
+        xs = (agents, buffers, rollouts, jax.random.split(key_meta, num_agents))
         grad, (agents, metrics) = jax.lax.map(lambda x: grad_fn(meta_params, *x), xs, batch_size=cfg.agent_chunk)
         agents, reset = jax.vmap(partial(end_of_lifetime, nets, cfg))(agents, jax.random.split(key_reset, num_agents))
+        # a new agent empties the old buffer rather than allocating one: its stale trajectories are never sampled
+        buffers = buffers._replace(idx=jnp.where(reset, 0, buffers.idx), size=jnp.where(reset, 0, buffers.size))
         updates, meta_opt_state = jax.vmap(meta_tx.update, in_axes=(0, 0, None))(grad, meta_opt_state, meta_params)
         meta_params = optax.apply_updates(meta_params, jax.tree.map(lambda u: u.mean(0), updates))
-        return meta_params, meta_opt_state, agents, reset, metrics | {"meta_grad_norm": jax.vmap(optax.tree.norm)(grad)}
+        return meta_params, meta_opt_state, agents, buffers, reset, metrics | {"meta_grad_norm": jax.vmap(optax.tree.norm)(grad)}
 
     add = jax.jit(lambda a, b: jax.tree.map(jnp.add, a, b))
     steps_per_meta_step = num_agents * cfg.num_envs * cfg.num_steps * (cfg.num_updates + cfg.valid_rollouts)
@@ -383,7 +389,7 @@ def train(cfg: Config):
             game_rollouts, game_stats, envs[g] = collect_game(g, agents.params, agents.valid, envs[g], reset, jax.random.fold_in(key_collect, g))
             rollouts.append(game_rollouts)
             stats.append(game_stats)
-        meta_params, meta_opt_state, agents, reset, metrics = meta_step(meta_params, meta_opt_state, agents, rollouts, key_meta)
+        meta_params, meta_opt_state, agents, buffers, reset, metrics = meta_step(meta_params, meta_opt_state, agents, buffers, rollouts, key_meta)
         step_totals = (stats, reset.astype(jnp.int32))
         totals = step_totals if totals is None else add(totals, step_totals)
 

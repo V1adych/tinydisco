@@ -18,7 +18,7 @@ TINY = Config(
 
 
 def test_buffer_wraps_and_samples_the_new_rollout():
-    """Rollouts overwrite the oldest trajectories, and a batch without replay holds only the rollout stored last."""
+    """Rollouts overwrite the oldest trajectories, and the last update's batch without replay holds only the rollout stored last."""
     cfg = replace(TINY, buffer_size=5 * TINY.num_steps, replay=0.0, batch=8)  # room for 5 trajectories, 2 per rollout
     buffer = init_buffer(make_nets(cfg, [make("Atari-breakout")[0]]), cfg)
     for k in range(3):  # rollout k into slots 2k and 2k + 1: rollout 2 into slots 4 and 0, over rollout 0's first
@@ -26,9 +26,11 @@ def test_buffer_wraps_and_samples_the_new_rollout():
         buffer = store(buffer, rollout)
     assert buffer.size == 5 and buffer.idx == 1
     assert jnp.array_equal(buffer.data.reward[0], jnp.array([2, 0, 1, 1, 2], jnp.float32))
-    batch = sample(cfg, buffer, jax.random.key(0))
-    assert batch.obs.shape[:2] == (cfg.num_steps + 1, 8) and batch.reward.shape == (cfg.num_steps, 8)
+    batch, ready = sample(cfg, buffer, cfg.num_updates - 1, jax.random.key(0))
+    assert batch.obs.shape[:2] == (cfg.num_steps + 1, 8) and batch.reward.shape == (cfg.num_steps, 8) and not ready
     assert (batch.reward == 2).all(), "the new share must come from the rollout stored last"
+    batch, _ = sample(replace(cfg, replay=1.0), buffer, 1, jax.random.key(0))
+    assert set(batch.reward[0].tolist()) <= {0.0, 1.0}, "update 1 must not see rollout 2"
 
 
 def test_meta_steps_run():
