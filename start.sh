@@ -18,6 +18,9 @@ apt-get update -qq && apt-get install -y -qq --no-install-recommends git curl ca
 curl -LsSf https://astral.sh/uv/0.13.0/install.sh | sh > /dev/null
 export PATH=/root/.local/bin:$PATH
 mkdir -p ~/.ssh
+# sshd refuses the provider's authorized_keys if it, ~/.ssh or ~ is not root's alone, as on some Vast hosts
+chown root:root ~ ~/.ssh ~/.ssh/authorized_keys 2> /dev/null
+chmod go-w ~ && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys 2> /dev/null
 
 # Repo access: a read-only deploy key, base64-encoded in GITHUB_DEPLOY_KEY
 echo "$GITHUB_DEPLOY_KEY" | base64 -d > ~/.ssh/id_ed25519
@@ -37,5 +40,8 @@ if [ -z "$RUN_COMMAND" ]; then
     sleep infinity
 fi
 
+# prints reach the provider's log as they happen, and every compile reports how long it took
+export PYTHONUNBUFFERED=1 JAX_LOG_COMPILES=1
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
 # e.g. python launch.py python src/disco.py --track
 uv run $RUN_COMMAND

@@ -7,3 +7,4 @@ try_wandb.py
 .envrc
 .venv/
 artifacts/
+profiling/
