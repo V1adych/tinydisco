@@ -1,4 +1,5 @@
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, NamedTuple
@@ -141,16 +142,20 @@ def make_nets(cfg: Config, envs: list) -> Nets:
     return Nets(num_actions, obs_space, new_agent, new_critic, graphdef, critic_graphdef, agent_tx, optax.adam(cfg.critic_lr), inner_grad)
 
 
-def init_buffer(nets: Nets, cfg: Config) -> Buffer:
-    n, T = cfg.buffer_size // cfg.num_steps, cfg.num_steps
-    data = Rollout(
-        obs=jnp.zeros((T + 1, n, *nets.obs_space.shape), nets.obs_space.dtype),
-        action=jnp.zeros((T, n), jnp.int32),
-        reward=jnp.zeros((T, n)),
-        done=jnp.zeros((T, n), bool),
-        mu=jnp.zeros((T, n, nets.num_actions)),
+def zero_rollouts(nets: Nets, cfg: Config, lead: tuple[int, ...], n: int) -> Rollout:
+    """Rollouts of n trajectories with leading axes lead: (*lead, T, n, ...)."""
+    T = cfg.num_steps
+    return Rollout(
+        obs=jnp.zeros((*lead, T + 1, n, *nets.obs_space.shape), nets.obs_space.dtype),
+        action=jnp.zeros((*lead, T, n), jnp.int32),
+        reward=jnp.zeros((*lead, T, n)),
+        done=jnp.zeros((*lead, T, n), bool),
+        mu=jnp.zeros((*lead, T, n, nets.num_actions)),
     )
-    return Buffer(data, jnp.int32(0), jnp.int32(0))
+
+
+def init_buffer(nets: Nets, cfg: Config) -> Buffer:
+    return Buffer(zero_rollouts(nets, cfg, (), cfg.buffer_size // cfg.num_steps), jnp.int32(0), jnp.int32(0))
 
 
 def draw_lifetime(cfg: Config, key: jax.Array) -> jax.Array:
@@ -328,7 +333,8 @@ def end_of_lifetime(nets: Nets, cfg: Config, agent: Agent, key: jax.Array) -> tu
 def train(cfg: Config):
     run_name = cfg.run_name or f"disco_s{cfg.seed}_{time.strftime('%Y%m%d-%H%M%S')}"
     logger = Logger(cfg, cfg.wandb_project, run_name, cfg.track)  # first, so that wandb records the console of a crash during setup
-    games = [make(f"Atari-{game}")[0] for game in cfg.games]
+    pool = ThreadPoolExecutor()  # per-game setup and compiles run side by side: 19 games, many cores
+    games = [env for env, _ in pool.map(lambda game: make(f"Atari-{game}"), cfg.games)]
     nets = make_nets(cfg, games)
     num_agents, per_game = len(games) * cfg.agents_per_game, cfg.agents_per_game
     assert cfg.buffer_size // cfg.num_steps >= cfg.num_updates * cfg.num_envs, "a meta step's rollouts must fit in the buffer at once"
@@ -346,28 +352,33 @@ def train(cfg: Config):
     agents = jax.jit(jax.vmap(partial(init_agent, nets, cfg)))(valid, jax.random.split(key, num_agents))
     buffers = jax.jit(jax.vmap(lambda _: init_buffer(nets, cfg)))(jnp.arange(num_agents))
     # under jit, so that leaves that are the same array (atari's obs and its state's frame stack) get buffers of their own for donation
-    envs = [
-        jax.jit(jax.vmap(partial(init_envs, game, cfg)))(jax.random.split(jax.random.fold_in(key, g + 1), per_game)) for g, game in enumerate(games)
-    ]
+    envs = list(pool.map(lambda g: jax.jit(jax.vmap(partial(init_envs, games[g], cfg)))(jax.random.split(jax.random.fold_in(key, g + 1), per_game)), range(len(games))))
     reset = jnp.zeros(num_agents, bool)
+    # every game's agents write their rollouts in here, in place, so that the meta step takes them without a copy
+    rollouts = jax.jit(partial(zero_rollouts, nets, cfg, (num_agents, cfg.num_updates + cfg.valid_rollouts), cfg.num_envs))()
 
-    @partial(jax.jit, static_argnums=0, donate_argnums=3)
-    def collect_game(g, params, valid, envs, reset, key):
-        """Game g's agents' rollouts for the meta step, their episode stats and their envs after it."""
-        params, valid, reset = jax.tree.map(lambda x: x[g * per_game : (g + 1) * per_game], (params, valid, reset))
-        rollouts, stats, envs = jax.vmap(partial(collect, nets, cfg, games[g]))(params, valid, envs, reset, jax.random.split(key, per_game))
-        return rollouts, jax.tree.map(jnp.sum, stats), envs
+    @partial(jax.jit, static_argnums=0, donate_argnums=(3, 5))
+    def collect_game(g, params, valid, envs, reset, rollouts, key):
+        """Game g's agents' rollouts for the meta step written into rollouts, their episode stats and their envs after it."""
+        agents_of_game = slice(g * per_game, (g + 1) * per_game)
+        params, valid, reset = jax.tree.map(lambda x: x[agents_of_game], (params, valid, reset))
+        game_rollouts, stats, envs = jax.vmap(partial(collect, nets, cfg, games[g]))(params, valid, envs, reset, jax.random.split(key, per_game))
+        return jax.tree.map(lambda r, x: r.at[agents_of_game].set(x), rollouts, game_rollouts), jax.tree.map(jnp.sum, stats), envs
 
     @partial(jax.jit, donate_argnums=(0, 1, 2, 3))
     def meta_step(meta_params, meta_opt_state, agents, buffers, rollouts, key):
-        rollouts = jax.tree.map(lambda *x: jnp.concatenate(x), *rollouts)
-        # the training rollouts go into the buffers first, in place; (rollouts, T, N, ...) -> (T, rollouts * N, ...)
-        train = jax.tree.map(lambda x: jnp.moveaxis(x[:, : cfg.num_updates], 1, 2).reshape(x.shape[0], x.shape[2], -1, *x.shape[4:]), rollouts)
-        buffers = jax.vmap(store)(buffers, train)
+        # the training rollouts go into the buffers first, one rollout at a time, in place
+        put = lambda buffers, k: (jax.vmap(store)(buffers, jax.tree.map(lambda x: x[:, k], rollouts)), None)
+        buffers = jax.lax.scan(put, buffers, jnp.arange(cfg.num_updates))[0]
         key_meta, key_reset = jax.random.split(key)
         grad_fn = jax.grad(partial(outer_loss, nets, cfg, meta_graphdef), has_aux=True)
-        xs = (agents, buffers, rollouts, jax.random.split(key_meta, num_agents))
-        grad, (agents, metrics) = jax.lax.map(lambda x: grad_fn(meta_params, *x), xs, batch_size=cfg.agent_chunk)
+
+        def agent_grad(agent, i, key):
+            # the buffers and rollouts are read by index: as inputs of the map, it would copy them into chunks
+            return grad_fn(meta_params, agent, *jax.tree.map(lambda x: x[i], (buffers, rollouts)), key)
+
+        xs = (agents, jnp.arange(num_agents), jax.random.split(key_meta, num_agents))
+        grad, (agents, metrics) = jax.lax.map(lambda x: agent_grad(*x), xs, batch_size=cfg.agent_chunk)
         agents, reset = jax.vmap(partial(end_of_lifetime, nets, cfg))(agents, jax.random.split(key_reset, num_agents))
         # a new agent empties the old buffer rather than allocating one: its stale trajectories are never sampled
         buffers = buffers._replace(idx=jnp.where(reset, 0, buffers.idx), size=jnp.where(reset, 0, buffers.size))
@@ -381,13 +392,18 @@ def train(cfg: Config):
         f"{run_name}: meta-network {num_params(nnx.merge(meta_graphdef, meta_params)):,} params, {len(games)} games x {per_game} agents, {steps_per_meta_step:,} env steps per meta step"
     )
 
+    # compiled ahead, all at once; XLA compiles each program on one thread
+    meta_step = pool.submit(meta_step.lower(meta_params, meta_opt_state, agents, buffers, rollouts, key).compile)
+    collect_games = [pool.submit(collect_game.lower(g, agents.params, agents.valid, envs[g], reset, rollouts, key).compile) for g in range(len(games))]
+    collect_games, meta_step = [c.result() for c in collect_games], meta_step.result()
+    pool.shutdown()
+
     totals, last_time, last_step = None, time.perf_counter(), start
     for i in range(start + 1, cfg.meta_steps + 1):
         key_collect, key_meta = jax.random.split(jax.random.fold_in(key, i))
-        rollouts, stats = [], []
+        stats = []
         for g in range(len(games)):
-            game_rollouts, game_stats, envs[g] = collect_game(g, agents.params, agents.valid, envs[g], reset, jax.random.fold_in(key_collect, g))
-            rollouts.append(game_rollouts)
+            rollouts, game_stats, envs[g] = collect_games[g](agents.params, agents.valid, envs[g], reset, rollouts, jax.random.fold_in(key_collect, g))
             stats.append(game_stats)
         meta_params, meta_opt_state, agents, buffers, reset, metrics = meta_step(meta_params, meta_opt_state, agents, buffers, rollouts, key_meta)
         step_totals = (stats, reset.astype(jnp.int32))
@@ -397,6 +413,7 @@ def train(cfg: Config):
             metrics, (stats, resets) = jax.device_get((metrics, totals))
             now = time.perf_counter()
             log = {"sps": (i - last_step) * steps_per_meta_step / max(1e-6, now - last_time)}
+            log["gpu_peak_gb"] = (jax.local_devices()[0].memory_stats() or {}).get("peak_bytes_in_use", 0) / 2**30  # None on a CPU
             for g, name in enumerate(cfg.games):
                 agents_of_game = slice(g * per_game, (g + 1) * per_game)
                 log |= {f"{name}/{k}": np.mean(v[agents_of_game]) for k, v in metrics.items()}
@@ -406,7 +423,7 @@ def train(cfg: Config):
                     f"{name}/episodes": s["episodes"],
                     f"{name}/resets": resets[agents_of_game].sum(),
                 }
-            logger.log(i, log, console=["sps", *(f"{name}/score" for name in cfg.games)])
+            logger.log(i, log, console=["sps", "gpu_peak_gb", *(f"{name}/score" for name in cfg.games)])
             totals, last_time, last_step = None, now, i
 
         if cfg.save_interval and (i % cfg.save_interval == 0 or i == cfg.meta_steps):
