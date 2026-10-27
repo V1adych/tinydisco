@@ -333,8 +333,7 @@ def end_of_lifetime(nets: Nets, cfg: Config, agent: Agent, key: jax.Array) -> tu
 def train(cfg: Config):
     run_name = cfg.run_name or f"disco_s{cfg.seed}_{time.strftime('%Y%m%d-%H%M%S')}"
     logger = Logger(cfg, cfg.wandb_project, run_name, cfg.track)  # first, so that wandb records the console of a crash during setup
-    pool = ThreadPoolExecutor()  # per-game setup and compiles run side by side: 19 games, many cores
-    games = [env for env, _ in pool.map(lambda game: make(f"Atari-{game}"), cfg.games)]
+    games = [make(f"Atari-{game}")[0] for game in cfg.games]
     nets = make_nets(cfg, games)
     num_agents, per_game = len(games) * cfg.agents_per_game, cfg.agents_per_game
     assert cfg.buffer_size // cfg.num_steps >= cfg.num_updates * cfg.num_envs, "a meta step's rollouts must fit in the buffer at once"
@@ -352,7 +351,7 @@ def train(cfg: Config):
     agents = jax.jit(jax.vmap(partial(init_agent, nets, cfg)))(valid, jax.random.split(key, num_agents))
     buffers = jax.jit(jax.vmap(lambda _: init_buffer(nets, cfg)))(jnp.arange(num_agents))
     # under jit, so that leaves that are the same array (atari's obs and its state's frame stack) get buffers of their own for donation
-    envs = list(pool.map(lambda g: jax.jit(jax.vmap(partial(init_envs, games[g], cfg)))(jax.random.split(jax.random.fold_in(key, g + 1), per_game)), range(len(games))))
+    envs = [jax.jit(jax.vmap(partial(init_envs, game, cfg)))(jax.random.split(jax.random.fold_in(key, g + 1), per_game)) for g, game in enumerate(games)]
     reset = jnp.zeros(num_agents, bool)
     # every game's agents write their rollouts in here, in place, so that the meta step takes them without a copy
     rollouts = jax.jit(partial(zero_rollouts, nets, cfg, (num_agents, cfg.num_updates + cfg.valid_rollouts), cfg.num_envs))()
@@ -392,7 +391,8 @@ def train(cfg: Config):
         f"{run_name}: meta-network {num_params(nnx.merge(meta_graphdef, meta_params)):,} params, {len(games)} games x {per_game} agents, {steps_per_meta_step:,} env steps per meta step"
     )
 
-    # compiled ahead, all at once; XLA compiles each program on one thread
+    # compiled ahead, all at once: XLA compiles each program on one thread (tracing stays sequential, Python holds the GIL)
+    pool = ThreadPoolExecutor()
     meta_step = pool.submit(meta_step.lower(meta_params, meta_opt_state, agents, buffers, rollouts, key).compile)
     collect_games = [pool.submit(collect_game.lower(g, agents.params, agents.valid, envs[g], reset, rollouts, key).compile) for g in range(len(games))]
     collect_games, meta_step = [c.result() for c in collect_games], meta_step.result()

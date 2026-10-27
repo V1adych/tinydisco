@@ -41,7 +41,9 @@ if [ -z "$RUN_COMMAND" ]; then
 fi
 
 # prints reach the provider's log as they happen, and every compile reports how long it took
-export PYTHONUNBUFFERED=1 JAX_LOG_COMPILES=1
+export PYTHONUNBUFFERED=1
+export JAX_LOG_COMPILES=1
+export JAX_COMPILATION_CACHE_DIR=~/jax_cache
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
 # e.g. python launch.py python src/disco.py --track
 uv run $RUN_COMMAND
