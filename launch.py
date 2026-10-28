@@ -41,7 +41,7 @@ def call(url: str, key: str, body: dict, method: str = "POST") -> dict:
 
 def vast(script: str, env: dict):
     key = os.environ["VASTAI_API_KEY"]
-    offers = call("https://console.vast.ai/api/v0/bundles/", key, VAST_OFFER_FILTER | {"gpu_name": {"eq": os.environ.get("GPU", "RTX 4090")}})["offers"]
+    offers = call("https://console.vast.ai/api/v0/bundles/", key, VAST_OFFER_FILTER | {"gpu_name": {"eq": os.environ.get("GPU", "RTX 5090")}})["offers"]
     body = {"image": IMAGE, "disk": DISK_GB, "runtype": "ssh", "label": "meta-rl", "onstart": script, "env": env}
     for offer in offers:  # listings go stale within minutes, so the first offer may already be gone
         if "CN" in str(offer.get("geolocation")):
@@ -57,7 +57,7 @@ def runpod(script: str, env: dict):
     body = {
         "name": "meta-rl",
         "cloud": os.environ.get("CLOUD", "COMMUNITY"),
-        "gpu": {"id": os.environ.get("GPU", "NVIDIA GeForce RTX 4090"), "count": 1, "minCudaVersion": "12.8"},
+        "gpu": {"id": os.environ.get("GPU", "NVIDIA GeForce RTX 5090"), "count": 1, "minCudaVersion": "12.8"},
         "image": IMAGE,
         "entrypoint": ["/bin/bash", "-c"],
         "cmd": [script],
@@ -67,5 +67,6 @@ def runpod(script: str, env: dict):
     return call("https://api.runpod.io/v2/pods", os.environ["RUNPOD_API_KEY"], body)
 
 
-env = {k: os.environ[k] for k in ("WANDB_API_KEY", "GITHUB_DEPLOY_KEY")} | {"RUN_COMMAND": " ".join(sys.argv[1:])}
-print({"vast": vast, "runpod": runpod}[os.environ.get("PROVIDER", "vast")](Path("start.sh").read_text(), env))
+if __name__ == "__main__":  # importing this module must not rent anything
+    env = {k: os.environ[k] for k in ("WANDB_API_KEY", "GITHUB_DEPLOY_KEY")} | {"RUN_COMMAND": " ".join(sys.argv[1:])}
+    print({"vast": vast, "runpod": runpod}[os.environ.get("PROVIDER", "vast")](Path("start.sh").read_text(), env))
