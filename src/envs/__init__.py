@@ -6,7 +6,8 @@
 
 Names: 'Chain-<variant>' (envs.chain.CHAINS), 'Grid-<variant>' or 'Grid-<variant>-collect' for the 18-action set (envs.grid.GRIDS),
 Craftax names such as 'Craftax-Classic-Pixels-v1', 'Atari-<game>' with a jaxtari game (envs.atari.TRAIN_GAMES, HOLDOUT_GAMES),
-'Arc-<game>' with an ARC-AGI-3 game ported in envs.arc (envs.arc.ARC_GAMES), and gymnax names such as 'Asterix-MinAtar'.
+'Arc-<game>' with an ARC-AGI-3 game ported in envs.arc (envs.arc.ARC_GAMES; the sets OFFICIAL, TRAIN, HOLDOUT and what each
+game is are described there), and gymnax names such as 'Asterix-MinAtar'.
 env.num_actions, env.observation_space(params) and env.action_space(params) work for all of them.
 Observations are uint8 (0-255 for [0, 1]); the models scale them back.
 """
