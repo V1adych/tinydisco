@@ -11,17 +11,34 @@ from flax import nnx
 from jax import numpy as jnp
 
 from checkpoint import fetch_checkpoint, load_checkpoint, save_checkpoint
-from envs import make
-from envs.atari import TRAIN_GAMES
+from envs import arc, atari, make
 from log import Logger
 from nn import FeedForward, MetaNetwork, RuleInputs, agent_heads, normalize, num_params, take
 from utils import entropy, kl, mixflow_grad, retrace, scale_by_adam_sg_denom, vtrace
 
 
+class Spec(NamedTuple):
+    """A game's agents: the conv torso (per conv: pixel block, features, kernel; see nn.FeedForward), the dense width,
+    the adam learning rate, and the lifetimes in env steps they draw from (with probability proportional to 1 / lifetime,
+    so that every lifetime gets the same share of experience)."""
+
+    convs: tuple[tuple[int, int, int], ...]
+    hidden: int
+    lr: float
+    lifetimes: tuple[int, ...]
+
+
+# the DQN torso (Mnih et al. 2015): 8x8 stride 4, 4x4 stride 2, 3x3 (84 -> 20 -> 9 -> 7); lifetimes: DiscoRL's ratios at 1/20 scale
+ATARI = Spec(((4, 32, 2), (2, 64, 2), (1, 64, 3)), 512, lr=3e-4, lifetimes=(1_000_000, 2_500_000, 5_000_000, 10_000_000))
+# one-hot 64x64 color frames: 12x12 stride 4, 4x4 stride 2, 3x3 (64 -> 14 -> 6 -> 4)
+ARC = Spec(((4, 32, 3), (2, 64, 2), (1, 64, 3)), 512, lr=3e-4, lifetimes=ATARI.lifetimes)
+SPECS = {f"Atari-{game}": ATARI for game in atari.TRAIN} | {f"Arc-{game}": ARC for game in arc.TRAIN}
+
+
 @dataclass(frozen=True)
 class Config:
-    games: tuple[str, ...] = tuple(f"Atari-{game}" for game in TRAIN_GAMES)  # envs.make names; one observation shape
-    agents_per_game: int = 1
+    games: tuple[str, ...] = tuple(SPECS)  # envs.make names, each with a Spec in SPECS
+    agents_per_game: int = 8
     num_envs: int = 8  # per agent
     num_steps: int = 29  # T of a rollout
     num_updates: int = 10  # agent updates per meta step, all backpropagated through
@@ -30,14 +47,12 @@ class Config:
     # shortcut: whole frame stacks are stored (28 KB per step), so the buffer is small; store single frames if it must grow
     buffer_size: int = 10_000  # transitions per agent
     valid_rollouts: int = 6  # rollouts that score the updated agent: 6 x 8 = 48 trajectories, as DiscoRL
-    lifetimes: tuple[int, ...] = (1_000_000, 2_500_000, 5_000_000, 10_000_000)  # env steps; DiscoRL's ratios at 1/20 scale
     meta_steps: int = 20_000
     seed: int = 0
     gamma: float = 0.997  # DiscoRL's on Atari
     lam: float = 0.95  # trace decay of Retrace and V-trace
     # agent
     d: int = 64  # bins of y and z (DiscoRL: 600)
-    lr: float = 3e-4
     max_abs_update: float = 1.0  # cap on each parameter's adam step before the learning rate, as DiscoRL
     q_cost: float = 0.5
     critic_lr: float = 1e-3
@@ -61,10 +76,11 @@ class Config:
 
 
 class Nets(NamedTuple):
-    """What all agents share: one network for every game, its action axis padded to the most actions any game has."""
+    """What a game's agents share: the networks of its Spec, their action axis padded to the most actions any game has."""
 
     num_actions: int
     obs_space: Any
+    lifetimes: jax.Array
     new_agent: Any  # new_agent(rngs=...) -> FeedForward with the outputs of nn.agent_heads
     new_critic: Any
     graphdef: Any
@@ -117,17 +133,26 @@ def inner_loss(graphdef, num_actions: int, cfg: Config, params, targets, data: t
     return loss.mean()
 
 
-def make_nets(cfg: Config, envs: list) -> Nets:
-    num_actions = max(env.num_actions for env in envs)
-    obs_space = envs[0].observation_space(None)
-    assert all(env.observation_space(None).shape == obs_space.shape for env in envs), "the games must share an observation shape"
-    new_agent = partial(FeedForward, num_actions + cfg.d + num_actions * cfg.d + num_actions, obs_space.shape)
-    new_critic = partial(FeedForward, 1, obs_space.shape)
+def make_nets(cfg: Config, env, spec: Spec, num_actions: int) -> Nets:
+    obs_space = env.observation_space(None)
+    new_agent = partial(FeedForward, num_actions + cfg.d + num_actions * cfg.d + num_actions, obs_space.shape, spec.convs, spec.hidden)
+    new_critic = partial(FeedForward, 1, obs_space.shape, spec.convs, spec.hidden)
     graphdef, _ = nnx.split(new_agent(rngs=nnx.Rngs(0)))
     critic_graphdef, _ = nnx.split(new_critic(rngs=nnx.Rngs(0)))
-    agent_tx = optax.chain(scale_by_adam_sg_denom(), optax.clip(cfg.max_abs_update), optax.scale(-cfg.lr))
+    agent_tx = optax.chain(scale_by_adam_sg_denom(), optax.clip(cfg.max_abs_update), optax.scale(-spec.lr))
     inner_grad = mixflow_grad(partial(inner_loss, graphdef, num_actions, cfg))
-    return Nets(num_actions, obs_space, new_agent, new_critic, graphdef, critic_graphdef, agent_tx, optax.adam(cfg.critic_lr), inner_grad)
+    return Nets(
+        num_actions,
+        obs_space,
+        jnp.array(spec.lifetimes),
+        new_agent,
+        new_critic,
+        graphdef,
+        critic_graphdef,
+        agent_tx,
+        optax.adam(cfg.critic_lr),
+        inner_grad,
+    )
 
 
 def init_buffer(nets: Nets, cfg: Config) -> Buffer:
@@ -142,17 +167,11 @@ def init_buffer(nets: Nets, cfg: Config) -> Buffer:
     return Buffer(data, jnp.int32(0), jnp.int32(0))
 
 
-def draw_lifetime(cfg: Config, key: jax.Array) -> jax.Array:
-    """With probability proportional to 1 / lifetime, so that every lifetime gets the same share of experience."""
-    lifetimes = jnp.array(cfg.lifetimes)
-    return jax.random.choice(key, lifetimes, p=(1 / lifetimes) / (1 / lifetimes).sum())
-
-
-def init_agent(nets: Nets, cfg: Config, valid: jax.Array, key: jax.Array) -> Agent:
+def init_agent(nets: Nets, valid: jax.Array, key: jax.Array) -> Agent:
     key_agent, key_critic, key_lifetime, key_age = jax.random.split(key, 4)
     _, params = nnx.split(nets.new_agent(rngs=nnx.Rngs(key_agent)))
     _, critic = nnx.split(nets.new_critic(rngs=nnx.Rngs(key_critic)))
-    lifetime = draw_lifetime(cfg, key_lifetime)
+    lifetime = jax.random.choice(key_lifetime, nets.lifetimes, p=(1 / nets.lifetimes) / (1 / nets.lifetimes).sum())
     # lifetimes start staggered so the population always spans young and old agents
     age = jax.random.randint(key_age, (), 0, lifetime)
     return Agent(params, nets.agent_tx.init(params), critic, nets.critic_tx.init(critic), valid, age, lifetime)
@@ -305,18 +324,19 @@ def end_of_lifetime(nets: Nets, cfg: Config, env, agent: Agent, buffer: Buffer, 
     key_agent, key_envs = jax.random.split(key)
     age = agent.age + (cfg.num_updates + cfg.valid_rollouts) * cfg.num_steps * cfg.num_envs
     reset = age >= agent.lifetime
-    fresh = init_agent(nets, cfg, agent.valid, key_agent)._replace(age=jnp.int32(0))
+    fresh = init_agent(nets, agent.valid, key_agent)._replace(age=jnp.int32(0))
     agent = jax.tree.map(lambda f, a: jnp.where(reset, f, a), fresh, agent._replace(age=age))
     buffer = buffer._replace(idx=jnp.where(reset, 0, buffer.idx), size=jnp.where(reset, 0, buffer.size))
     envs = jax.tree.map(lambda f, e: jnp.where(reset, f, e), init_envs(env, cfg, key_envs), envs)
     return agent, buffer, envs, reset
 
 
-def train(cfg: Config):
+def train(cfg: Config, specs: dict[str, Spec] = SPECS):
     run_name = cfg.run_name or f"disco_s{cfg.seed}_{time.strftime('%Y%m%d-%H%M%S')}"
     logger = Logger(cfg, cfg.wandb_project, run_name, cfg.track)  # first, so that wandb records the console of a crash during setup
     games = [make(game)[0] for game in cfg.games]
-    nets = make_nets(cfg, games)
+    num_actions = max(game.num_actions for game in games)
+    nets = [make_nets(cfg, game, specs[name], num_actions) for name, game in zip(cfg.games, games)]
     num_agents, per_game = len(games) * cfg.agents_per_game, cfg.agents_per_game
     meta_network, start = MetaNetwork(cfg.d, cfg.meta_hidden, nnx.Rngs(cfg.seed)), 0
     if cfg.resume:
@@ -331,9 +351,9 @@ def train(cfg: Config):
     agents, buffers, envs = [], [], []
     for g, game in enumerate(games):
         key_agents, key_envs = jax.random.split(jax.random.fold_in(key, g))
-        valid = jnp.broadcast_to(jnp.arange(nets.num_actions) < game.num_actions, (per_game, nets.num_actions))
-        agents.append(jax.jit(jax.vmap(partial(init_agent, nets, cfg)))(valid, jax.random.split(key_agents, per_game)))
-        buffers.append(jax.jit(jax.vmap(lambda _: init_buffer(nets, cfg)))(jnp.arange(per_game)))
+        valid = jnp.broadcast_to(jnp.arange(num_actions) < game.num_actions, (per_game, num_actions))
+        agents.append(jax.jit(jax.vmap(partial(init_agent, nets[g])))(valid, jax.random.split(key_agents, per_game)))
+        buffers.append(jax.jit(jax.vmap(lambda _: init_buffer(nets[g], cfg)))(jnp.arange(per_game)))
         # under jit, so that leaves that are the same array (atari's obs and its state's frame stack) get buffers of their own for donation
         envs.append(jax.jit(jax.vmap(partial(init_envs, game, cfg)))(jax.random.split(key_envs, per_game)))
 
@@ -344,16 +364,18 @@ def train(cfg: Config):
         lifetime, their metrics and each game's episode stats."""
         grads, resets, metrics, stats = [], [], [], []
         for g, game in enumerate(games):
-            grad_fn = jax.grad(partial(outer_loss, nets, cfg, meta_graphdef, game), has_aux=True)
+            grad_fn = jax.grad(partial(outer_loss, nets[g], cfg, meta_graphdef, game), has_aux=True)
 
-            def one(agent, buffer, envs, key):
+            def one(agent, buffer, envs, key, nets=nets[g]):
                 key_loss, key_reset = jax.random.split(key)
                 grad, (agent, buffer, envs, metrics, stats) = grad_fn(meta_params, agent, buffer, envs, key_loss)
                 agent, buffer, envs, reset = end_of_lifetime(nets, cfg, game, agent, buffer, envs, key_reset)
                 return grad, agent, buffer, envs, reset, metrics | {"meta_grad_norm": optax.tree.norm(grad)}, stats
 
             # the game's agents together: their envs step in one kernel (collection is launch-bound), their convs are grouped
-            grad, agents[g], buffers[g], envs[g], reset, game_metrics, game_stats = jax.vmap(one)(agents[g], buffers[g], envs[g], jax.random.split(jax.random.fold_in(key, g), per_game))
+            grad, agents[g], buffers[g], envs[g], reset, game_metrics, game_stats = jax.vmap(one)(
+                agents[g], buffers[g], envs[g], jax.random.split(jax.random.fold_in(key, g), per_game)
+            )
             grads.append(grad)
             resets.append(reset)
             metrics.append(game_metrics)
@@ -374,7 +396,9 @@ def train(cfg: Config):
 
     totals, last_time, last_step = None, time.perf_counter(), start
     for i in range(start + 1, cfg.meta_steps + 1):
-        meta_params, meta_opt_state, agents, buffers, envs, resets, metrics, stats = meta_step(meta_params, meta_opt_state, agents, buffers, envs, jax.random.fold_in(key, i))
+        meta_params, meta_opt_state, agents, buffers, envs, resets, metrics, stats = meta_step(
+            meta_params, meta_opt_state, agents, buffers, envs, jax.random.fold_in(key, i)
+        )
         step_totals = (stats, [r.astype(jnp.int32) for r in resets])
         totals = step_totals if totals is None else jax.tree.map(jnp.add, totals, step_totals)
 

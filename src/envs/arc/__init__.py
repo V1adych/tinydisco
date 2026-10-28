@@ -21,6 +21,7 @@ from .games.bd01.game import Bd01
 from .games.bp01.game import Bp01
 from .games.co01.game import Co01
 from .games.dl01.game import Dl01
+from .games.base import NUM_COLORS, SIZE
 from .games.fs01.game import Fs01
 from .games.g50t.game import G50t
 from .games.gr01.game import Gr01

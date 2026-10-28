@@ -43,36 +43,30 @@ def space_to_depth(x: jax.Array, k: int) -> jax.Array:
     return jnp.moveaxis(x.reshape(*lead, h // k, k, w // k, k, c), -4, -3).reshape(*lead, h // k, w // k, k * k * c)
 
 
-NUM_COLORS = 16  # ARC-AGI-3 frames are one channel of color indices; the network one-hots them
-# per observation shape: the conv torso as (in_features, out_features, kernel) over space_to_depth blocks, and its output size
-TORSOS = {
-    # the DQN torso (Mnih et al. 2015) on Atari frames: 8x8 stride 4 = 2x2 on 4x4 blocks (21x21 -> 20x20), 4x4 stride 2 = 2x2 on 2x2 blocks (-> 9x9), 3x3 (-> 7x7)
-    (84, 84, 4): ((4 * 16, 32, (2, 2)), (32 * 4, 64, (2, 2)), (64, 64, (3, 3)), 7 * 7 * 64),
-    # ARC frames, one-hot: 3x3 on 4x4 blocks (16x16 -> 14x14), 2x2 on 2x2 blocks (-> 6x6), 3x3 (-> 4x4)
-    (64, 64, 1): ((NUM_COLORS * 16, 32, (3, 3)), (32 * 4, 64, (2, 2)), (64, 64, (3, 3)), 4 * 4 * 64),
-}
-
-
 class FeedForward(nnx.Module):
-    """A conv torso for the observation shape (TORSOS), then a linear output. The torso computes in bf16
-    with float32 weights; the output layer is float32, since the losses on it are softmaxes and KLs. The output starts
-    near zero (weights of stddev 0.01, as DiscoRL's heads): uniform policies and predictions, zero values.
-    The strided convs are written as stride-1 convs over space_to_depth blocks (the same function, parameters and
-    fan-in): cuDNN has no tensor-core kernels for a stride-4 conv on 4 channels, or its gradients."""
+    """A conv torso, a dense layer, a linear output. convs gives each conv as (block, features, kernel): a stride-1 VALID
+    conv over block x block pixel blocks, the same function, parameters and fan-in as a stride-block conv with a
+    block * kernel kernel (cuDNN has no tensor-core kernels for a stride-4 conv on 4 channels, or its gradients).
+    With colors, the observation is one channel of color indices below colors, one-hot before the convs. The torso
+    computes in bf16 with float32 weights; the output layer is float32, since the losses on it are softmaxes and KLs.
+    The output starts near zero (weights of stddev 0.01, as DiscoRL's heads): uniform policies and predictions, zero values."""
 
-    BLOCKS = (4, 2, 1)
-
-    def __init__(self, num_outputs: int, obs_shape: tuple[int, ...], rngs: nnx.Rngs):
+    def __init__(self, num_outputs: int, obs_shape: tuple[int, ...], convs: tuple[tuple[int, int, int], ...], hidden: int, rngs: nnx.Rngs, colors: int = 0):
         bf16 = dict(dtype=jnp.bfloat16, param_dtype=jnp.float32, rngs=rngs)
-        *convs, flat = TORSOS[tuple(obs_shape)]
-        self.one_hot = obs_shape[-1] == 1
-        self.convs = nnx.List([nnx.Conv(i, o, kernel, padding="VALID", **bf16) for i, o, kernel in convs])
-        self.dense = nnx.Linear(flat, 512, **bf16)
-        self.out = nnx.Linear(512, num_outputs, kernel_init=nnx.initializers.normal(1e-2), rngs=rngs)
+        h, w, c = obs_shape
+        self.colors = colors
+        c = colors or c
+        self.blocks, self.convs = tuple(k for k, _, _ in convs), nnx.List()
+        for k, features, kernel in convs:
+            assert h % k == 0 and w % k == 0, f"a {h}x{w} map does not split into {k}x{k} blocks"
+            self.convs.append(nnx.Conv(c * k * k, features, (kernel, kernel), padding="VALID", **bf16))
+            h, w, c = h // k - kernel + 1, w // k - kernel + 1, features
+        self.dense = nnx.Linear(h * w * c, hidden, **bf16)
+        self.out = nnx.Linear(hidden, num_outputs, kernel_init=nnx.initializers.normal(1e-2), rngs=rngs)
 
     def __call__(self, obs: jax.Array) -> jax.Array:
-        x = jax.nn.one_hot(obs.squeeze(-1), NUM_COLORS) if self.one_hot else to_float(obs)
-        for conv, k in zip(self.convs, self.BLOCKS):
+        x = jax.nn.one_hot(obs.squeeze(-1), self.colors) if self.colors else to_float(obs)
+        for conv, k in zip(self.convs, self.blocks):
             x = nnx.relu(conv(space_to_depth(x, k)))
         x = nnx.relu(self.dense(x.reshape(*x.shape[:-3], -1)))
         return self.out(x.astype(jnp.float32))

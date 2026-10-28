@@ -5,14 +5,17 @@ from flax import nnx
 from jax import numpy as jnp
 
 from envs import make
+from envs.arc import NUM_COLORS
 from nn import FeedForward, MetaNetwork, RuleInputs, agent_heads, space_to_depth
+
+DQN = (((4, 32, 2), (2, 64, 2), (1, 64, 3)), 512)  # convs and dense width, as disco.ATARI
 
 
 def test_agent_heads():
     env, params = make("Atari-breakout")
     obs, _ = jax.vmap(env.reset, in_axes=(0, None))(jax.random.split(jax.random.key(0), 5), params)
     num_actions, d = env.num_actions, 8
-    agent = FeedForward(num_actions + d + num_actions * d + num_actions, obs.shape[1:], nnx.Rngs(0))
+    agent = FeedForward(num_actions + d + num_actions * d + num_actions, obs.shape[1:], *DQN, nnx.Rngs(0))
     valid = jnp.arange(num_actions) < 2
     logits, y, z, q = agent_heads(agent(obs), num_actions, d, valid)
     assert logits.shape == (5, num_actions) and y.shape == (5, d) and z.shape == (5, num_actions, d) and q.shape == (5, num_actions)
@@ -22,9 +25,9 @@ def test_agent_heads():
 
 def test_block_convs_are_the_strided_convs():
     """A 2x2 conv over k x k blocks equals the k*2 x k*2 stride-k conv whose kernel is the block conv's, unfolded."""
-    net = FeedForward(1, (84, 84, 4), nnx.Rngs(0))
+    net = FeedForward(1, (84, 84, 4), *DQN, nnx.Rngs(0))
     x = jax.random.normal(jax.random.key(1), (3, 84, 84, 4))
-    for conv, k in zip(net.convs[:2], FeedForward.BLOCKS):
+    for conv, k in zip(net.convs[:2], net.blocks):
         kernel, c = conv.kernel.value, conv.in_features // (k * k)
         unfolded = kernel.reshape(2, 2, k, k, c, -1).transpose(0, 2, 1, 3, 4, 5).reshape(2 * k, 2 * k, c, -1)
         strided = jax.lax.conv_general_dilated(x, unfolded, (k, k), "VALID", dimension_numbers=("NHWC", "HWIO", "NHWC")) + conv.bias.value
@@ -36,8 +39,9 @@ def test_block_convs_are_the_strided_convs():
 def test_arc_torso():
     env, _ = make("Arc-ls20")
     obs, _ = jax.vmap(env.reset)(jax.random.split(jax.random.key(0), 3))
-    out = FeedForward(7, obs.shape[1:], nnx.Rngs(0))(obs)
+    out = FeedForward(7, obs.shape[1:], ((4, 32, 3), (2, 64, 2), (1, 64, 3)), 512, nnx.Rngs(0), colors=NUM_COLORS)(obs)
     assert out.shape == (3, 7) and out.dtype == jnp.float32
+    assert FeedForward(7, obs.shape[1:], ((8, 16, 3),), 32, nnx.Rngs(0), colors=NUM_COLORS)(obs).shape == (3, 7), "any conv stack must fit"
 
 
 def rule_inputs(reward):

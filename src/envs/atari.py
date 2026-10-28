@@ -14,11 +14,11 @@ from jaxtari.wrappers import AtariState, AtariWrapper
 # jaxtari's 🥇 games of the Atari 57 except Montezuma's Revenge (no reward without exploration), Fishing Derby (its port
 # takes ~35 ms a step on a GPU at any batch size, 10x the others) and the held-out three, plus four 🥈 ones (close to the
 # originals, may miss parts); statuses from jaxtari's games_covered.md
-TRAIN_GAMES = (
+TRAIN = (
     "amidar", "asterix", "asteroids", "bankheist", "enduro", "freeway", "frostbite", "gopher", "gravitar",
     "kangaroo", "phoenix", "seaquest", "surround", "tennis", "yarsrevenge", "mspacman", "spaceinvaders", "qbert", "beamrider",
 )
-HOLDOUT_GAMES = ("breakout", "pong", "boxing")
+HOLDOUT = ("breakout", "pong", "boxing")
 SIZE, FRAME_SKIP, FRAME_STACK = 84, 4, 4
 
 
