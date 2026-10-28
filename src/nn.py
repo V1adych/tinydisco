@@ -53,50 +53,30 @@ def space_to_depth(x: jax.Array, k: int) -> jax.Array:
 
 
 class Recurrent(nnx.Module):
-    def __init__(
-        self,
-        num_outputs: int,
-        obs_shape: tuple[int, ...],
-        convs: tuple[tuple[int, int, int], ...],
-        hidden: int,
-        rngs: nnx.Rngs,
-        colors: int = 0,
-    ):
+    """Patch layers (per layer: pixel block, features; a linear over each block's pixels, i.e. a stride-block conv as a
+    matmul), a dense layer, a GRU, a linear output. With colors, the frame is one channel of color indices, one-hot
+    before the first layer. The encoder computes in bf16 with float32 weights; the GRU and the output layer are float32.
+    The output starts near zero (weights of stddev 0.01, as DiscoRL's heads): uniform policies and predictions, zero values."""
+
+    def __init__(self, num_outputs: int, obs_shape: tuple[int, ...], convs: tuple[tuple[int, int], ...], hidden: int, rngs: nnx.Rngs, colors: int = 0):
         bf16 = dict(dtype=jnp.bfloat16, param_dtype=jnp.float32, rngs=rngs)
         h, w, c = obs_shape
-        self.colors, self.hidden = colors, hidden
-        self.blocks, self.convs = tuple(k for k, _, _ in convs), nnx.List()
-        for i, (k, features, kernel) in enumerate(convs):
+        self.colors, self.blocks, self.layers = colors, tuple(k for k, _ in convs), nnx.List()
+        c = colors or c
+        for k, features in convs:
             assert h % k == 0 and w % k == 0, f"a {h}x{w} map does not split into {k}x{k} blocks"
-            if i == 0 and colors:
-                assert kernel == 1 and c == 1, "a color frame's first conv is a patch embedding"
-                self.embed = nnx.Linear(colors * k * k, features, **bf16)  # its kernel is the table, its bias the conv's
-            else:
-                self.convs.append(nnx.Conv(c * k * k, features, (kernel, kernel), padding="VALID", **bf16))
-            h, w, c = h // k - kernel + 1, w // k - kernel + 1, features
+            self.layers.append(nnx.Linear(c * k * k, features, **bf16))
+            h, w, c = h // k, w // k, features
         self.dense = nnx.Linear(h * w * c, hidden, **bf16)
         self.gru = nnx.GRUCell(hidden, hidden, rngs=rngs)
         self.out = nnx.Linear(hidden, num_outputs, kernel_init=nnx.initializers.normal(1e-2), rngs=rngs)
 
-    def patch_embed(self, patches: jax.Array) -> jax.Array:
-        """(..., k * k) color indices of a block -> (..., features): the first conv on their one-hot."""
-        return self.embed(jax.nn.one_hot(patches, self.colors, dtype=jnp.bfloat16).reshape(*patches.shape[:-1], -1))
-
     def encode(self, obs: jax.Array) -> jax.Array:
-        """(..., H, W, C) frames -> (..., hidden) float32 features."""
-        x, convs = obs if self.colors else to_float(obs), iter(self.convs)
-        for i, k in enumerate(self.blocks):
-            x = space_to_depth(x, k)
-            if i == 0 and self.colors:
-                embed = jax.checkpoint(self.patch_embed)
-                x = jax.lax.map(embed, x) if x.ndim > 4 else embed(x)
-            else:
-                x = next(convs)(x)
-            x = nnx.relu(x)
+        """(B, H, W, C) frames -> (B, hidden) float32 features."""
+        x = jax.nn.one_hot(obs.squeeze(-1), self.colors, dtype=jnp.bfloat16) if self.colors else to_float(obs)
+        for layer, k in zip(self.layers, self.blocks):
+            x = nnx.relu(layer(space_to_depth(x, k)))
         return nnx.relu(self.dense(x.reshape(*x.shape[:-3], -1))).astype(jnp.float32)
-
-    def initial_carry(self, batch: int) -> jax.Array:
-        return jnp.zeros((batch, self.hidden))
 
     def step(self, carry: jax.Array, obs: jax.Array) -> tuple[jax.Array, jax.Array]:
         """One step of a batch: the carry (B, hidden) after the frames (B, H, W, C), and the output (B, num_outputs)."""
@@ -106,7 +86,9 @@ class Recurrent(nnx.Module):
     def unroll(self, carry: jax.Array, obs: jax.Array, done: jax.Array) -> jax.Array:
         """The output (T + 1, B, num_outputs) over trajectories: obs (T + 1, B, ...) from the carry (B, hidden) at the
         first, where done (T, B) at t ends the episode, so the carry restarts from zeros at t + 1."""
-        x = self.encode(obs)
+        # one step's frames at a time, recomputed in the backward pass: the encoder's activations (a one-hot is 16x
+        # the frame) of one step in memory, not of the whole batch
+        x = jax.lax.map(jax.checkpoint(self.encode), obs)
         reset = jnp.concatenate([jnp.zeros_like(done[:1]), done])
 
         def body(carry, step):
@@ -164,9 +146,12 @@ class ActionMix(nnx.Module):
     def __init__(self, in_features: int, out_features: int, rngs: nnx.Rngs):
         self.linear = nnx.Linear(2 * in_features, out_features, rngs=rngs)
 
-    def __call__(self, x: jax.Array, valid: jax.Array) -> jax.Array:  # (..., A, C), valid (A,): the mean is over legal actions
+    def __call__(self, x: jax.Array, valid: jax.Array, shared: jax.Array | None = None) -> jax.Array:
+        """x (..., A, C), valid (A,): the mean is over legal actions; shared (..., out_features): features of the step,
+        the same for every action, added before the activation (a linear share computed once, not per action)."""
         mean = jnp.broadcast_to(x.mean(-2, keepdims=True, where=valid[:, None]), x.shape)
-        return nnx.relu(self.linear(jnp.concatenate([x, mean], -1)))
+        out = self.linear(jnp.concatenate([x, mean], -1))
+        return nnx.relu(out if shared is None else out + shared[..., None, :])
 
 
 class MetaNetwork(nnx.Module):
@@ -184,7 +169,8 @@ class MetaNetwork(nnx.Module):
         self.gru = nnx.GRUCell(19, hidden_dim, rngs=rngs)
         self.y_hat = nnx.Linear(hidden_dim, d, kernel_init=out_init, rngs=rngs)
         self.z_hat = nnx.Linear(hidden_dim, d, kernel_init=out_init, rngs=rngs)
-        self.pi_mix = ActionMix(hidden_dim + 2, 16, rngs)
+        self.pi_h = nnx.Linear(hidden_dim, 16, rngs=rngs)  # the GRU state's share of pi_mix's input, the same for every action
+        self.pi_mix = ActionMix(2, 16, rngs)
         self.pi_hat = nnx.Linear(16, 1, kernel_init=out_init, rngs=rngs)
 
     def __call__(self, x: RuleInputs) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -240,8 +226,7 @@ class MetaNetwork(nnx.Module):
 
         # a plain scan: nnx.scan rejects the cell's params when they are gradient tracers of the meta-gradient
         _, h = jax.lax.scan(body, jnp.zeros((x.reward.shape[1], self.hidden_dim)), (inputs, x.discount == 0), reverse=True)
-        per_action_h = jnp.concatenate([jnp.broadcast_to(h[:, :, None], (*h.shape[:2], num_actions, h.shape[-1])), action_emb], -1)
-        pi_hat = self.pi_hat(self.pi_mix(per_action_h, x.valid)).squeeze(-1)
+        pi_hat = self.pi_hat(self.pi_mix(action_emb, x.valid, self.pi_h(h))).squeeze(-1)
         return jnp.where(x.valid, pi_hat, ILLEGAL), self.y_hat(h), self.z_hat(h)
 
 

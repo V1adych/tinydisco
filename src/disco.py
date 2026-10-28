@@ -19,11 +19,11 @@ from utils import entropy, kl, mixflow_grad, retrace, scale_by_adam_sg_denom, vt
 
 
 class Spec(NamedTuple):
-    """A game's agents: the conv encoder (per conv: pixel block, features, kernel; see nn.Recurrent), the dense and GRU
+    """A game's agents: the patch encoder (per layer: pixel block, features; see nn.Recurrent), the dense and GRU
     width, the adam learning rate, the lifetimes in env steps they draw from (with probability proportional to
     1 / lifetime, so that every lifetime gets the same share of experience), and colors when the frame is color indices."""
 
-    convs: tuple[tuple[int, int, int], ...]
+    convs: tuple[tuple[int, int], ...]
     hidden: int
     lr: float
     lifetimes: tuple[int, ...]
@@ -31,9 +31,9 @@ class Spec(NamedTuple):
 
 
 # patch embeddings as nanodisco's frame stem: 4x4 pixel patches, then 3x3 of those (84 -> 21 -> 7); lifetimes: DiscoRL's ratios at 1/20 scale
-ATARI = Spec(((4, 32, 1), (3, 64, 1)), 512, lr=3e-4, lifetimes=(1_000_000, 2_500_000, 5_000_000, 10_000_000))
+ATARI = Spec(((4, 32), (3, 64)), 512, lr=3e-4, lifetimes=(1_000_000, 2_500_000, 5_000_000, 10_000_000))
 # 64x64 color frames: 4x4 patches of colors, then 2x2 of those (64 -> 16 -> 8)
-ARC = Spec(((4, 32, 1), (2, 64, 1)), 512, lr=3e-4, lifetimes=ATARI.lifetimes, colors=arc.NUM_COLORS)
+ARC = Spec(((4, 32), (2, 64)), 512, lr=3e-4, lifetimes=ATARI.lifetimes, colors=arc.NUM_COLORS)
 SPECS = {f"Atari-{game}": ATARI for game in atari.TRAIN} | {f"Arc-{game}": ARC for game in arc.TRAIN}
 
 
@@ -251,7 +251,7 @@ def critic_values(nets: Nets, critic, batch: Rollout) -> jax.Array:
     """(T + 1, B) values of the batch's observations. The critic never acts, so it always unrolls from zeros: what it
     is trained on is what it is used on."""
     model = nnx.merge(nets.critic_graphdef, critic)
-    return model.unroll(model.initial_carry(batch.obs.shape[1]), batch.obs, batch.done).squeeze(-1)
+    return model.unroll(jnp.zeros((batch.obs.shape[1], nets.hidden)), batch.obs, batch.done).squeeze(-1)
 
 
 def learn(nets: Nets, cfg: Config, meta_graphdef, meta_params, params, opt_state, batch: Rollout, valid: jax.Array):

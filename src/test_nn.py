@@ -8,7 +8,7 @@ from envs import make
 from envs.arc import NUM_COLORS
 from nn import MetaNetwork, Recurrent, RuleInputs, agent_heads, space_to_depth
 
-PATCH = (((4, 32, 1), (3, 64, 1)), 512)  # convs and width, as disco.ATARI
+PATCH = (((4, 32), (3, 64)), 512)  # patch layers and width, as disco.ATARI
 
 
 def test_agent_heads():
@@ -17,7 +17,7 @@ def test_agent_heads():
     num_actions, d = env.num_actions, 8
     agent = Recurrent(num_actions + d + num_actions * d + num_actions, obs.shape[1:], *PATCH, nnx.Rngs(0))
     valid = jnp.arange(num_actions) < 2
-    carry, out = agent.step(agent.initial_carry(5), obs)
+    carry, out = agent.step(jnp.zeros((5, 512)), obs)
     logits, y, z, q = agent_heads(out, num_actions, d, valid)
     assert carry.shape == (5, 512)
     assert logits.shape == (5, num_actions) and y.shape == (5, d) and z.shape == (5, num_actions, d) and q.shape == (5, num_actions)
@@ -28,37 +28,32 @@ def test_agent_heads():
 def test_unroll_matches_steps():
     """Unrolling a trajectory gives what stepping through it gives, with the carry restarted after an episode end."""
     T, B = 4, 2
-    net = Recurrent(3, (8, 8, 1), ((4, 8, 1),), 16, nnx.Rngs(0), colors=NUM_COLORS)
+    net = Recurrent(3, (8, 8, 1), ((4, 8),), 16, nnx.Rngs(0), colors=NUM_COLORS)
     obs = jax.random.randint(jax.random.key(0), (T + 1, B, 8, 8, 1), 0, NUM_COLORS, jnp.uint8)
     done = jnp.zeros((T, B), bool).at[1, 0].set(True)
-    carry, outs = net.initial_carry(B), []
+    carry, outs = jnp.zeros((B, 16)), []
     for t in range(T + 1):
         carry = jnp.where((done[t - 1] if t else jnp.zeros(B, bool))[:, None], 0.0, carry)
         carry, out = net.step(carry, obs[t])
         outs.append(out)
-    assert jnp.allclose(net.unroll(net.initial_carry(B), obs, done), jnp.stack(outs), atol=1e-6)
+    assert jnp.allclose(net.unroll(jnp.zeros((B, 16)), obs, done), jnp.stack(outs), atol=1e-6)
 
 
-def test_block_convs_are_the_strided_convs():
-    """A 2x2 conv over k x k blocks equals the k*2 x k*2 stride-k conv whose kernel is the block conv's, unfolded."""
-    net = Recurrent(1, (84, 84, 4), ((4, 32, 2), (2, 64, 2), (1, 64, 3)), 32, nnx.Rngs(0))
-    x = jax.random.normal(jax.random.key(1), (3, 84, 84, 4))
-    for conv, k in zip(net.convs[:2], net.blocks):
-        kernel, c = conv.kernel.value, conv.in_features // (k * k)
-        unfolded = kernel.reshape(2, 2, k, k, c, -1).transpose(0, 2, 1, 3, 4, 5).reshape(2 * k, 2 * k, c, -1)
-        strided = jax.lax.conv_general_dilated(x, unfolded, (k, k), "VALID", dimension_numbers=("NHWC", "HWIO", "NHWC")) + conv.bias.value
-        blocks = jax.lax.conv_general_dilated(space_to_depth(x, k), kernel, (1, 1), "VALID", dimension_numbers=("NHWC", "HWIO", "NHWC")) + conv.bias.value
-        assert jnp.allclose(strided, blocks, atol=1e-4), f"block conv {k} differs from the strided conv"
-        x = jax.random.normal(jax.random.key(2), (3, 20, 20, 32))
+def test_patch_layer_is_the_strided_conv():
+    """A patch layer over k x k blocks is the k x k stride-k conv whose kernel is the layer's weight, unfolded."""
+    net = Recurrent(1, (84, 84, 1), *PATCH, nnx.Rngs(0))
+    x = jax.random.normal(jax.random.key(1), (3, 84, 84, 1)).astype(jnp.bfloat16)  # the layer computes in bf16
+    layer, k = net.layers[0], net.blocks[0]
+    kernel = layer.kernel.value.astype(jnp.bfloat16).astype(jnp.float32).reshape(k, k, 1, -1)
+    strided = jax.lax.conv_general_dilated(x.astype(jnp.float32), kernel, (k, k), "VALID", dimension_numbers=("NHWC", "HWIO", "NHWC")) + layer.bias.value
+    assert jnp.allclose(strided, layer(space_to_depth(x, k)).astype(jnp.float32), rtol=1e-2, atol=2e-2), "the patch layer differs from the strided conv"
 
 
-def test_color_frames_encode_the_same_per_step_and_per_trajectory():
-    """The per-step one-hot path of a trajectory's frames equals encoding the frames as one batch."""
+def test_color_frames():
     env, _ = make("Arc-ls20")
     obs, _ = jax.vmap(env.reset)(jax.random.split(jax.random.key(0), 6))
-    net = Recurrent(7, obs.shape[1:], ((4, 32, 1), (2, 64, 1)), 512, nnx.Rngs(0), colors=NUM_COLORS)
-    assert jnp.array_equal(net.encode(obs.reshape(3, 2, *obs.shape[1:])), net.encode(obs).reshape(3, 2, -1))
-    _, out = net.step(net.initial_carry(6), obs)
+    net = Recurrent(7, obs.shape[1:], ((4, 32), (2, 64)), 512, nnx.Rngs(0), colors=NUM_COLORS)
+    _, out = net.step(jnp.zeros((6, 512)), obs)
     assert out.shape == (6, 7) and out.dtype == jnp.float32
 
 
@@ -116,8 +111,8 @@ def test_meta_ignores_padded_actions():
 if __name__ == "__main__":
     test_agent_heads()
     test_unroll_matches_steps()
-    test_block_convs_are_the_strided_convs()
-    test_color_frames_encode_the_same_per_step_and_per_trajectory()
+    test_patch_layer_is_the_strided_conv()
+    test_color_frames()
     test_meta_looks_only_ahead_within_an_episode()
     test_meta_serves_any_number_of_actions()
     test_meta_ignores_padded_actions()
