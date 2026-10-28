@@ -19,19 +19,20 @@ from utils import entropy, kl, mixflow_grad, retrace, scale_by_adam_sg_denom, vt
 
 class Spec(NamedTuple):
     """A game's agents: the conv torso (per conv: pixel block, features, kernel; see nn.FeedForward), the dense width,
-    the adam learning rate, and the lifetimes in env steps they draw from (with probability proportional to 1 / lifetime,
-    so that every lifetime gets the same share of experience)."""
+    the adam learning rate, the lifetimes in env steps they draw from (with probability proportional to 1 / lifetime,
+    so that every lifetime gets the same share of experience), and colors when the frame is color indices to one-hot."""
 
     convs: tuple[tuple[int, int, int], ...]
     hidden: int
     lr: float
     lifetimes: tuple[int, ...]
+    colors: int = 0
 
 
 # the DQN torso (Mnih et al. 2015): 8x8 stride 4, 4x4 stride 2, 3x3 (84 -> 20 -> 9 -> 7); lifetimes: DiscoRL's ratios at 1/20 scale
 ATARI = Spec(((4, 32, 2), (2, 64, 2), (1, 64, 3)), 512, lr=3e-4, lifetimes=(1_000_000, 2_500_000, 5_000_000, 10_000_000))
 # one-hot 64x64 color frames: 12x12 stride 4, 4x4 stride 2, 3x3 (64 -> 14 -> 6 -> 4)
-ARC = Spec(((4, 32, 3), (2, 64, 2), (1, 64, 3)), 512, lr=3e-4, lifetimes=ATARI.lifetimes)
+ARC = Spec(((4, 32, 3), (2, 64, 2), (1, 64, 3)), 512, lr=3e-4, lifetimes=ATARI.lifetimes, colors=arc.NUM_COLORS)
 SPECS = {f"Atari-{game}": ATARI for game in atari.TRAIN} | {f"Arc-{game}": ARC for game in arc.TRAIN}
 
 
@@ -135,8 +136,8 @@ def inner_loss(graphdef, num_actions: int, cfg: Config, params, targets, data: t
 
 def make_nets(cfg: Config, env, spec: Spec, num_actions: int) -> Nets:
     obs_space = env.observation_space(None)
-    new_agent = partial(FeedForward, num_actions + cfg.d + num_actions * cfg.d + num_actions, obs_space.shape, spec.convs, spec.hidden)
-    new_critic = partial(FeedForward, 1, obs_space.shape, spec.convs, spec.hidden)
+    new_agent = partial(FeedForward, num_actions + cfg.d + num_actions * cfg.d + num_actions, obs_space.shape, spec.convs, spec.hidden, colors=spec.colors)
+    new_critic = partial(FeedForward, 1, obs_space.shape, spec.convs, spec.hidden, colors=spec.colors)
     graphdef, _ = nnx.split(new_agent(rngs=nnx.Rngs(0)))
     critic_graphdef, _ = nnx.split(new_critic(rngs=nnx.Rngs(0)))
     agent_tx = optax.chain(scale_by_adam_sg_denom(), optax.clip(cfg.max_abs_update), optax.scale(-spec.lr))
