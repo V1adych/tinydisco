@@ -5,7 +5,7 @@ from flax import nnx
 from jax import numpy as jnp
 
 from envs import make
-from nn import FeedForward, MetaNetwork, RuleInputs, agent_heads
+from nn import FeedForward, MetaNetwork, RuleInputs, agent_heads, space_to_depth
 
 
 def test_agent_heads():
@@ -18,6 +18,19 @@ def test_agent_heads():
     assert logits.shape == (5, num_actions) and y.shape == (5, d) and z.shape == (5, num_actions, d) and q.shape == (5, num_actions)
     assert logits.dtype == jnp.float32
     assert (jax.nn.softmax(logits)[:, 2:] == 0).all(), "illegal actions must get no probability"
+
+
+def test_block_convs_are_the_strided_convs():
+    """A 2x2 conv over k x k blocks equals the k*2 x k*2 stride-k conv whose kernel is the block conv's, unfolded."""
+    net = FeedForward(1, nnx.Rngs(0))
+    x = jax.random.normal(jax.random.key(1), (3, 84, 84, 4))
+    for conv, k in zip(net.convs[:2], FeedForward.BLOCKS):
+        kernel, c = conv.kernel.value, conv.in_features // (k * k)
+        unfolded = kernel.reshape(2, 2, k, k, c, -1).transpose(0, 2, 1, 3, 4, 5).reshape(2 * k, 2 * k, c, -1)
+        strided = jax.lax.conv_general_dilated(x, unfolded, (k, k), "VALID", dimension_numbers=("NHWC", "HWIO", "NHWC")) + conv.bias.value
+        blocks = jax.lax.conv_general_dilated(space_to_depth(x, k), kernel, (1, 1), "VALID", dimension_numbers=("NHWC", "HWIO", "NHWC")) + conv.bias.value
+        assert jnp.allclose(strided, blocks, atol=1e-4), f"block conv {k} differs from the strided conv"
+        x = jax.random.normal(jax.random.key(2), (3, 20, 20, 32))
 
 
 def rule_inputs(reward):
@@ -73,6 +86,7 @@ def test_meta_ignores_padded_actions():
 
 if __name__ == "__main__":
     test_agent_heads()
+    test_block_convs_are_the_strided_convs()
     test_meta_looks_only_ahead_within_an_episode()
     test_meta_serves_any_number_of_actions()
     test_meta_ignores_padded_actions()

@@ -37,18 +37,28 @@ class ActorCriticRNN(nnx.Module):
         return carry, out[..., : self.num_actions], out[..., self.num_actions :], self.critic(x).squeeze(-1)
 
 
+def space_to_depth(x: jax.Array, k: int) -> jax.Array:
+    """Each k x k block of pixels becomes channels: (..., H, W, C) -> (..., H / k, W / k, k * k * C)."""
+    *lead, h, w, c = x.shape
+    return jnp.moveaxis(x.reshape(*lead, h // k, k, w // k, k, c), -4, -3).reshape(*lead, h // k, w // k, k * k * c)
+
+
 class FeedForward(nnx.Module):
     """The DQN torso (Mnih et al. 2015) on (84, 84, 4) uint8 frames, then a linear output. The torso computes in bf16
     with float32 weights; the output layer is float32, since the losses on it are softmaxes and KLs. The output starts
-    near zero (weights of stddev 0.01, as DiscoRL's heads): uniform policies and predictions, zero values."""
+    near zero (weights of stddev 0.01, as DiscoRL's heads): uniform policies and predictions, zero values.
+    The strided convs are written as stride-1 convs over space_to_depth blocks (the same function, parameters and
+    fan-in): cuDNN has no tensor-core kernels for a stride-4 conv on 4 channels, or its gradients."""
+
+    BLOCKS = (4, 2, 1)
 
     def __init__(self, num_outputs: int, rngs: nnx.Rngs):
         bf16 = dict(dtype=jnp.bfloat16, param_dtype=jnp.float32, rngs=rngs)
         self.convs = nnx.List(
             [
-                nnx.Conv(4, 32, (8, 8), strides=4, padding="VALID", **bf16),  # -> 20x20
-                nnx.Conv(32, 64, (4, 4), strides=2, padding="VALID", **bf16),  # -> 9x9
-                nnx.Conv(64, 64, (3, 3), strides=1, padding="VALID", **bf16),  # -> 7x7
+                nnx.Conv(4 * 16, 32, (2, 2), padding="VALID", **bf16),  # 8x8 stride 4 on 84x84: 2x2 on 21x21 -> 20x20
+                nnx.Conv(32 * 4, 64, (2, 2), padding="VALID", **bf16),  # 4x4 stride 2 on 20x20: 2x2 on 10x10 -> 9x9
+                nnx.Conv(64, 64, (3, 3), padding="VALID", **bf16),  # -> 7x7
             ]
         )
         self.dense = nnx.Linear(7 * 7 * 64, 512, **bf16)
@@ -56,8 +66,8 @@ class FeedForward(nnx.Module):
 
     def __call__(self, obs: jax.Array) -> jax.Array:
         x = to_float(obs)
-        for conv in self.convs:
-            x = nnx.relu(conv(x))
+        for conv, k in zip(self.convs, self.BLOCKS):
+            x = nnx.relu(conv(space_to_depth(x, k)))
         x = nnx.relu(self.dense(x.reshape(*x.shape[:-3], -1)))
         return self.out(x.astype(jnp.float32))
 
