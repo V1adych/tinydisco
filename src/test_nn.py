@@ -52,17 +52,14 @@ def test_block_convs_are_the_strided_convs():
         x = jax.random.normal(jax.random.key(2), (3, 20, 20, 32))
 
 
-def test_color_embedding_is_the_one_hot_conv():
-    """The summed per-(position, color) embeddings of a patch equal the patch conv of its one-hot colors."""
+def test_color_frames_encode_the_same_per_step_and_per_trajectory():
+    """The per-step one-hot path of a trajectory's frames equals encoding the frames as one batch."""
     env, _ = make("Arc-ls20")
-    obs, _ = jax.vmap(env.reset)(jax.random.split(jax.random.key(0), 3))
+    obs, _ = jax.vmap(env.reset)(jax.random.split(jax.random.key(0), 6))
     net = Recurrent(7, obs.shape[1:], ((4, 32, 1), (2, 64, 1)), 512, nnx.Rngs(0), colors=NUM_COLORS)
-    patches = space_to_depth(obs, 4)  # (3, 16, 16, 16) colors
-    one_hot = jax.nn.one_hot(patches, NUM_COLORS).reshape(*patches.shape[:-1], -1)  # (3, 16, 16, 16 * 16), position-major
-    reference = one_hot @ net.embed.kernel.value + net.embed.bias.value
-    assert jnp.allclose(net.patch_embed(patches).astype(jnp.float32), reference, atol=2e-2)
-    _, out = net.step(net.initial_carry(3), obs)
-    assert out.shape == (3, 7) and out.dtype == jnp.float32
+    assert jnp.array_equal(net.encode(obs.reshape(3, 2, *obs.shape[1:])), net.encode(obs).reshape(3, 2, -1))
+    _, out = net.step(net.initial_carry(6), obs)
+    assert out.shape == (6, 7) and out.dtype == jnp.float32
 
 
 def rule_inputs(reward):
@@ -120,7 +117,7 @@ if __name__ == "__main__":
     test_agent_heads()
     test_unroll_matches_steps()
     test_block_convs_are_the_strided_convs()
-    test_color_embedding_is_the_one_hot_conv()
+    test_color_frames_encode_the_same_per_step_and_per_trajectory()
     test_meta_looks_only_ahead_within_an_episode()
     test_meta_serves_any_number_of_actions()
     test_meta_ignores_padded_actions()

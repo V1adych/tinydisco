@@ -79,17 +79,20 @@ class Recurrent(nnx.Module):
         self.out = nnx.Linear(hidden, num_outputs, kernel_init=nnx.initializers.normal(1e-2), rngs=rngs)
 
     def patch_embed(self, patches: jax.Array) -> jax.Array:
-        """(..., k * k) color indices of a block -> (..., features): the embedding of each (position, color), summed."""
-        table = self.embed.kernel.value.astype(jnp.bfloat16)
-        index = patches.astype(jnp.int32) + self.colors * jnp.arange(patches.shape[-1])
-        return sum(table[index[..., j]] for j in range(patches.shape[-1])) + self.embed.bias.value.astype(jnp.bfloat16)
+        """(..., k * k) color indices of a block -> (..., features): the first conv on their one-hot."""
+        return self.embed(jax.nn.one_hot(patches, self.colors, dtype=jnp.bfloat16).reshape(*patches.shape[:-1], -1))
 
     def encode(self, obs: jax.Array) -> jax.Array:
         """(..., H, W, C) frames -> (..., hidden) float32 features."""
         x, convs = obs if self.colors else to_float(obs), iter(self.convs)
         for i, k in enumerate(self.blocks):
             x = space_to_depth(x, k)
-            x = nnx.relu(self.patch_embed(x) if i == 0 and self.colors else next(convs)(x))
+            if i == 0 and self.colors:
+                embed = jax.checkpoint(self.patch_embed)
+                x = jax.lax.map(embed, x) if x.ndim > 4 else embed(x)
+            else:
+                x = next(convs)(x)
+            x = nnx.relu(x)
         return nnx.relu(self.dense(x.reshape(*x.shape[:-3], -1))).astype(jnp.float32)
 
     def initial_carry(self, batch: int) -> jax.Array:
