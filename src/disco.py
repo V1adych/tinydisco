@@ -1,4 +1,5 @@
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, NamedTuple
@@ -136,7 +137,9 @@ def inner_loss(graphdef, num_actions: int, cfg: Config, params, targets, data: t
 
 def make_nets(cfg: Config, env, spec: Spec, num_actions: int) -> Nets:
     obs_space = env.observation_space(None)
-    new_agent = partial(FeedForward, num_actions + cfg.d + num_actions * cfg.d + num_actions, obs_space.shape, spec.convs, spec.hidden, colors=spec.colors)
+    new_agent = partial(
+        FeedForward, num_actions + cfg.d + num_actions * cfg.d + num_actions, obs_space.shape, spec.convs, spec.hidden, colors=spec.colors
+    )
     new_critic = partial(FeedForward, 1, obs_space.shape, spec.convs, spec.hidden, colors=spec.colors)
     graphdef, _ = nnx.split(new_agent(rngs=nnx.Rngs(0)))
     critic_graphdef, _ = nnx.split(new_critic(rngs=nnx.Rngs(0)))
@@ -348,6 +351,7 @@ def train(cfg: Config, specs: dict[str, Spec] = SPECS):
     meta_tx = optax.chain(optax.clip_by_global_norm(cfg.max_grad_norm), optax.adam(cfg.meta_lr))
     meta_opt_state = jax.vmap(lambda _: meta_tx.init(meta_params))(jnp.arange(num_agents))
     key = jax.random.key(cfg.seed)
+
     def init_state():
         """Per game: its agents, their buffers and envs, each with a leading axis over the game's agents."""
         agents, buffers, envs = [], [], []
@@ -360,50 +364,62 @@ def train(cfg: Config, specs: dict[str, Spec] = SPECS):
             envs.append(jax.jit(jax.vmap(partial(init_envs, game, cfg)))(jax.random.split(key_envs, per_game)))
         return agents, buffers, envs
 
-    @partial(jax.jit, donate_argnums=(2, 3, 4))
-    def meta_step(meta_params, meta_opt_state, agents, buffers, envs, key):
-        """Every agent's meta-gradient (outer_loss), then their clipped Adam steps averaged into one update of the
-        meta-network (DiscoRL). Also the agents, buffers and envs after their inner updates, which agents started a new
-        lifetime, their metrics and each game's episode stats."""
-        grads, resets, metrics, stats = [], [], [], []
-        for g, game in enumerate(games):
-            grad_fn = jax.grad(partial(outer_loss, nets[g], cfg, meta_graphdef, game), has_aux=True)
+    def game_step(g: int):
+        """The game's program: its agents' meta-gradients (outer_loss) and inner updates, which of them started a new
+        lifetime, their metrics and the game's episode stats. One program per game, so that the games run one after
+        another and share the scratch memory: in one program XLA interleaves them and their temporaries coexist."""
+        grad_fn = jax.grad(partial(outer_loss, nets[g], cfg, meta_graphdef, games[g]), has_aux=True)
 
-            def one(agent, buffer, envs, key, nets=nets[g]):
-                key_loss, key_reset = jax.random.split(key)
-                grad, (agent, buffer, envs, metrics, stats) = grad_fn(meta_params, agent, buffer, envs, key_loss)
-                agent, buffer, envs, reset = end_of_lifetime(nets, cfg, game, agent, buffer, envs, key_reset)
-                return grad, agent, buffer, envs, reset, metrics | {"meta_grad_norm": optax.tree.norm(grad)}, stats
+        def one(meta_params, agent, buffer, envs, key):
+            key_loss, key_reset = jax.random.split(key)
+            grad, (agent, buffer, envs, metrics, stats) = grad_fn(meta_params, agent, buffer, envs, key_loss)
+            agent, buffer, envs, reset = end_of_lifetime(nets[g], cfg, games[g], agent, buffer, envs, key_reset)
+            return grad, agent, buffer, envs, reset, metrics | {"meta_grad_norm": optax.tree.norm(grad)}, stats
 
-            # the game's agents together: their envs step in one kernel (collection is launch-bound), their convs are grouped
-            grad, agents[g], buffers[g], envs[g], reset, game_metrics, game_stats = jax.vmap(one)(
-                agents[g], buffers[g], envs[g], jax.random.split(jax.random.fold_in(key, g), per_game)
+        # the game's agents together: their envs step in one kernel (collection is launch-bound), their convs are grouped
+        def step(meta_params, agents, buffers, envs, key):
+            grad, agents, buffers, envs, reset, metrics, stats = jax.vmap(one, in_axes=(None, 0, 0, 0, 0))(
+                meta_params, agents, buffers, envs, jax.random.split(key, per_game)
             )
-            grads.append(grad)
-            resets.append(reset)
-            metrics.append(game_metrics)
-            stats.append(jax.tree.map(lambda s: s.sum(0), game_stats))
+            return grad, agents, buffers, envs, reset, metrics, jax.tree.map(lambda s: s.sum(0), stats)
+
+        return jax.jit(step, donate_argnums=(1, 2, 3))
+
+    @jax.jit
+    def meta_update(meta_params, meta_opt_state, grads):
+        """Every agent's clipped Adam step, averaged into one update of the meta-network (DiscoRL)."""
         grad = jax.tree.map(lambda *x: jnp.concatenate(x), *grads)
         updates, meta_opt_state = jax.vmap(meta_tx.update, in_axes=(0, 0, None))(grad, meta_opt_state, meta_params)
-        meta_params = optax.apply_updates(meta_params, jax.tree.map(lambda u: u.mean(0), updates))
-        return meta_params, meta_opt_state, agents, buffers, envs, resets, metrics, stats
+        return optax.apply_updates(meta_params, jax.tree.map(lambda u: u.mean(0), updates)), meta_opt_state
 
     steps_per_meta_step = num_agents * cfg.num_envs * cfg.num_steps * (cfg.num_updates + cfg.valid_rollouts)
     print(
         f"{run_name}: meta-network {num_params(nnx.merge(meta_graphdef, meta_params)):,} params, {len(games)} games x {per_game} agents, {steps_per_meta_step:,} env steps per meta step"
     )
 
-    # compiled on the state's shapes before the state exists, so that the compile (cudnn's autotuning) has the whole GPU
-    meta_step = meta_step.lower(meta_params, meta_opt_state, *jax.eval_shape(init_state), key).compile()
-    m = meta_step.memory_analysis()
-    print(f"meta step memory: inputs {m.argument_size_in_bytes / 2**30:.2f} GB, temporary {m.temp_size_in_bytes / 2**30:.2f} GB")
+    # compiled ahead, on the state's shapes before the state exists (so that cudnn's autotuning has the whole GPU), in
+    # threads: XLA releases the GIL while compiling, so the games' programs compile side by side
+    shapes = jax.eval_shape(init_state)
+    with ThreadPoolExecutor() as pool:
+        steps = list(pool.map(lambda g: game_step(g).lower(meta_params, shapes[0][g], shapes[1][g], shapes[2][g], key).compile(), range(len(games))))
+    m = [step.memory_analysis() for step in steps]
+    print(
+        f"meta step memory: inputs {sum(x.argument_size_in_bytes for x in m) / 2**30:.2f} GB, temporary {max(x.temp_size_in_bytes for x in m) / 2**30:.2f} GB (largest game)"
+    )
     agents, buffers, envs = init_state()
 
     totals, last_time, last_step = None, time.perf_counter(), start
     for i in range(start + 1, cfg.meta_steps + 1):
-        meta_params, meta_opt_state, agents, buffers, envs, resets, metrics, stats = meta_step(
-            meta_params, meta_opt_state, agents, buffers, envs, jax.random.fold_in(key, i)
-        )
+        grads, resets, metrics, stats = [], [], [], []
+        for g, step in enumerate(steps):
+            grad, agents[g], buffers[g], envs[g], reset, game_metrics, game_stats = step(
+                meta_params, agents[g], buffers[g], envs[g], jax.random.fold_in(jax.random.fold_in(key, i), g)
+            )
+            grads.append(grad)
+            resets.append(reset)
+            metrics.append(game_metrics)
+            stats.append(game_stats)
+        meta_params, meta_opt_state = meta_update(meta_params, meta_opt_state, grads)
         step_totals = (stats, [r.astype(jnp.int32) for r in resets])
         totals = step_totals if totals is None else jax.tree.map(jnp.add, totals, step_totals)
 
