@@ -15,7 +15,16 @@ def to_float(obs: jax.Array) -> jax.Array:
 class ActorCriticRNN(nnx.Module):
     """Patch-conv encoder -> GRU -> policy logits, y logits (LPG's predictions, empty for PPO) and value."""
 
-    def __init__(self, obs_shape: tuple[int, ...], num_actions: int, embed_dim: int, hidden_dim: int, patch_size: tuple[int, int], rngs: nnx.Rngs, y_dim: int = 0):
+    def __init__(
+        self,
+        obs_shape: tuple[int, ...],
+        num_actions: int,
+        embed_dim: int,
+        hidden_dim: int,
+        patch_size: tuple[int, int],
+        rngs: nnx.Rngs,
+        y_dim: int = 0,
+    ):
         h, w, c = obs_shape
         num_patches = (h // patch_size[0]) * (w // patch_size[1])
         self.hidden_dim = hidden_dim
@@ -43,33 +52,67 @@ def space_to_depth(x: jax.Array, k: int) -> jax.Array:
     return jnp.moveaxis(x.reshape(*lead, h // k, k, w // k, k, c), -4, -3).reshape(*lead, h // k, w // k, k * k * c)
 
 
-class FeedForward(nnx.Module):
-    """A conv torso, a dense layer, a linear output. convs gives each conv as (block, features, kernel): a stride-1 VALID
-    conv over block x block pixel blocks, the same function, parameters and fan-in as a stride-block conv with a
-    block * kernel kernel (cuDNN has no tensor-core kernels for a stride-4 conv on 4 channels, or its gradients).
-    With colors, the observation is one channel of color indices below colors, one-hot before the convs. The torso
-    computes in bf16 with float32 weights; the output layer is float32, since the losses on it are softmaxes and KLs.
-    The output starts near zero (weights of stddev 0.01, as DiscoRL's heads): uniform policies and predictions, zero values."""
-
-    def __init__(self, num_outputs: int, obs_shape: tuple[int, ...], convs: tuple[tuple[int, int, int], ...], hidden: int, rngs: nnx.Rngs, colors: int = 0):
+class Recurrent(nnx.Module):
+    def __init__(
+        self,
+        num_outputs: int,
+        obs_shape: tuple[int, ...],
+        convs: tuple[tuple[int, int, int], ...],
+        hidden: int,
+        rngs: nnx.Rngs,
+        colors: int = 0,
+    ):
         bf16 = dict(dtype=jnp.bfloat16, param_dtype=jnp.float32, rngs=rngs)
         h, w, c = obs_shape
-        self.colors = colors
-        c = colors or c
+        self.colors, self.hidden = colors, hidden
         self.blocks, self.convs = tuple(k for k, _, _ in convs), nnx.List()
-        for k, features, kernel in convs:
+        for i, (k, features, kernel) in enumerate(convs):
             assert h % k == 0 and w % k == 0, f"a {h}x{w} map does not split into {k}x{k} blocks"
-            self.convs.append(nnx.Conv(c * k * k, features, (kernel, kernel), padding="VALID", **bf16))
+            if i == 0 and colors:
+                assert kernel == 1 and c == 1, "a color frame's first conv is a patch embedding"
+                self.embed = nnx.Linear(colors * k * k, features, **bf16)  # its kernel is the table, its bias the conv's
+            else:
+                self.convs.append(nnx.Conv(c * k * k, features, (kernel, kernel), padding="VALID", **bf16))
             h, w, c = h // k - kernel + 1, w // k - kernel + 1, features
         self.dense = nnx.Linear(h * w * c, hidden, **bf16)
+        self.gru = nnx.GRUCell(hidden, hidden, rngs=rngs)
         self.out = nnx.Linear(hidden, num_outputs, kernel_init=nnx.initializers.normal(1e-2), rngs=rngs)
 
-    def __call__(self, obs: jax.Array) -> jax.Array:
-        x = jax.nn.one_hot(obs.squeeze(-1), self.colors) if self.colors else to_float(obs)
-        for conv, k in zip(self.convs, self.blocks):
-            x = nnx.relu(conv(space_to_depth(x, k)))
-        x = nnx.relu(self.dense(x.reshape(*x.shape[:-3], -1)))
-        return self.out(x.astype(jnp.float32))
+    def patch_embed(self, patches: jax.Array) -> jax.Array:
+        """(..., k * k) color indices of a block -> (..., features): the embedding of each (position, color), summed."""
+        table = self.embed.kernel.value.astype(jnp.bfloat16)
+        index = patches.astype(jnp.int32) + self.colors * jnp.arange(patches.shape[-1])
+        return sum(table[index[..., j]] for j in range(patches.shape[-1])) + self.embed.bias.value.astype(jnp.bfloat16)
+
+    def encode(self, obs: jax.Array) -> jax.Array:
+        """(..., H, W, C) frames -> (..., hidden) float32 features."""
+        x, convs = obs if self.colors else to_float(obs), iter(self.convs)
+        for i, k in enumerate(self.blocks):
+            x = space_to_depth(x, k)
+            x = nnx.relu(self.patch_embed(x) if i == 0 and self.colors else next(convs)(x))
+        return nnx.relu(self.dense(x.reshape(*x.shape[:-3], -1))).astype(jnp.float32)
+
+    def initial_carry(self, batch: int) -> jax.Array:
+        return jnp.zeros((batch, self.hidden))
+
+    def step(self, carry: jax.Array, obs: jax.Array) -> tuple[jax.Array, jax.Array]:
+        """One step of a batch: the carry (B, hidden) after the frames (B, H, W, C), and the output (B, num_outputs)."""
+        carry, _ = self.gru(carry, self.encode(obs))
+        return carry, self.out(carry)
+
+    def unroll(self, carry: jax.Array, obs: jax.Array, done: jax.Array) -> jax.Array:
+        """The output (T + 1, B, num_outputs) over trajectories: obs (T + 1, B, ...) from the carry (B, hidden) at the
+        first, where done (T, B) at t ends the episode, so the carry restarts from zeros at t + 1."""
+        x = self.encode(obs)
+        reset = jnp.concatenate([jnp.zeros_like(done[:1]), done])
+
+        def body(carry, step):
+            x_t, reset_t = step
+            carry, _ = self.gru(jnp.where(reset_t[:, None], 0.0, carry), x_t)
+            return carry, carry
+
+        _, carries = jax.lax.scan(body, carry, (x, reset))
+        return self.out(carries)
 
 
 def agent_heads(out: jax.Array, num_actions: int, d: int, valid: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
@@ -149,7 +192,18 @@ class MetaNetwork(nnx.Module):
         z_emb = self.z_net(x.z).squeeze(-1)  # (T + 1, N, A)
         z_avg, z_max = (x.pi * z_emb).sum(-1), jnp.where(x.valid, z_emb, -jnp.inf).max(-1)
         qv = x.q - x.v[..., None]
-        per_action = jnp.stack([pi, x.mu, z_emb[:-1], symlog(x.q), symlog(qv), normalize(qv, jnp.broadcast_to(x.valid, qv.shape)), jax.nn.one_hot(x.action, num_actions)], -1)
+        per_action = jnp.stack(
+            [
+                pi,
+                x.mu,
+                z_emb[:-1],
+                symlog(x.q),
+                symlog(qv),
+                normalize(qv, jnp.broadcast_to(x.valid, qv.shape)),
+                jax.nn.one_hot(x.action, num_actions),
+            ],
+            -1,
+        )
         action_emb = per_action
         for layer in self.action_net.layers:
             action_emb = layer(action_emb, x.valid)  # (T, N, A, 2)

@@ -6,26 +6,42 @@ from jax import numpy as jnp
 
 from envs import make
 from envs.arc import NUM_COLORS
-from nn import FeedForward, MetaNetwork, RuleInputs, agent_heads, space_to_depth
+from nn import MetaNetwork, Recurrent, RuleInputs, agent_heads, space_to_depth
 
-DQN = (((4, 32, 2), (2, 64, 2), (1, 64, 3)), 512)  # convs and dense width, as disco.ATARI
+PATCH = (((4, 32, 1), (3, 64, 1)), 512)  # convs and width, as disco.ATARI
 
 
 def test_agent_heads():
     env, params = make("Atari-breakout")
     obs, _ = jax.vmap(env.reset, in_axes=(0, None))(jax.random.split(jax.random.key(0), 5), params)
     num_actions, d = env.num_actions, 8
-    agent = FeedForward(num_actions + d + num_actions * d + num_actions, obs.shape[1:], *DQN, nnx.Rngs(0))
+    agent = Recurrent(num_actions + d + num_actions * d + num_actions, obs.shape[1:], *PATCH, nnx.Rngs(0))
     valid = jnp.arange(num_actions) < 2
-    logits, y, z, q = agent_heads(agent(obs), num_actions, d, valid)
+    carry, out = agent.step(agent.initial_carry(5), obs)
+    logits, y, z, q = agent_heads(out, num_actions, d, valid)
+    assert carry.shape == (5, 512)
     assert logits.shape == (5, num_actions) and y.shape == (5, d) and z.shape == (5, num_actions, d) and q.shape == (5, num_actions)
     assert logits.dtype == jnp.float32
     assert (jax.nn.softmax(logits)[:, 2:] == 0).all(), "illegal actions must get no probability"
 
 
+def test_unroll_matches_steps():
+    """Unrolling a trajectory gives what stepping through it gives, with the carry restarted after an episode end."""
+    T, B = 4, 2
+    net = Recurrent(3, (8, 8, 1), ((4, 8, 1),), 16, nnx.Rngs(0), colors=NUM_COLORS)
+    obs = jax.random.randint(jax.random.key(0), (T + 1, B, 8, 8, 1), 0, NUM_COLORS, jnp.uint8)
+    done = jnp.zeros((T, B), bool).at[1, 0].set(True)
+    carry, outs = net.initial_carry(B), []
+    for t in range(T + 1):
+        carry = jnp.where((done[t - 1] if t else jnp.zeros(B, bool))[:, None], 0.0, carry)
+        carry, out = net.step(carry, obs[t])
+        outs.append(out)
+    assert jnp.allclose(net.unroll(net.initial_carry(B), obs, done), jnp.stack(outs), atol=1e-6)
+
+
 def test_block_convs_are_the_strided_convs():
     """A 2x2 conv over k x k blocks equals the k*2 x k*2 stride-k conv whose kernel is the block conv's, unfolded."""
-    net = FeedForward(1, (84, 84, 4), *DQN, nnx.Rngs(0))
+    net = Recurrent(1, (84, 84, 4), ((4, 32, 2), (2, 64, 2), (1, 64, 3)), 32, nnx.Rngs(0))
     x = jax.random.normal(jax.random.key(1), (3, 84, 84, 4))
     for conv, k in zip(net.convs[:2], net.blocks):
         kernel, c = conv.kernel.value, conv.in_features // (k * k)
@@ -36,12 +52,17 @@ def test_block_convs_are_the_strided_convs():
         x = jax.random.normal(jax.random.key(2), (3, 20, 20, 32))
 
 
-def test_arc_torso():
+def test_color_embedding_is_the_one_hot_conv():
+    """The summed per-(position, color) embeddings of a patch equal the patch conv of its one-hot colors."""
     env, _ = make("Arc-ls20")
     obs, _ = jax.vmap(env.reset)(jax.random.split(jax.random.key(0), 3))
-    out = FeedForward(7, obs.shape[1:], ((4, 32, 3), (2, 64, 2), (1, 64, 3)), 512, nnx.Rngs(0), colors=NUM_COLORS)(obs)
+    net = Recurrent(7, obs.shape[1:], ((4, 32, 1), (2, 64, 1)), 512, nnx.Rngs(0), colors=NUM_COLORS)
+    patches = space_to_depth(obs, 4)  # (3, 16, 16, 16) colors
+    one_hot = jax.nn.one_hot(patches, NUM_COLORS).reshape(*patches.shape[:-1], -1)  # (3, 16, 16, 16 * 16), position-major
+    reference = one_hot @ net.embed.kernel.value + net.embed.bias.value
+    assert jnp.allclose(net.patch_embed(patches).astype(jnp.float32), reference, atol=2e-2)
+    _, out = net.step(net.initial_carry(3), obs)
     assert out.shape == (3, 7) and out.dtype == jnp.float32
-    assert FeedForward(7, obs.shape[1:], ((8, 16, 3),), 32, nnx.Rngs(0), colors=NUM_COLORS)(obs).shape == (3, 7), "any conv stack must fit"
 
 
 def rule_inputs(reward):
@@ -97,8 +118,9 @@ def test_meta_ignores_padded_actions():
 
 if __name__ == "__main__":
     test_agent_heads()
+    test_unroll_matches_steps()
     test_block_convs_are_the_strided_convs()
-    test_arc_torso()
+    test_color_embedding_is_the_one_hot_conv()
     test_meta_looks_only_ahead_within_an_episode()
     test_meta_serves_any_number_of_actions()
     test_meta_ignores_padded_actions()

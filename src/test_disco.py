@@ -14,7 +14,7 @@ TINY = Config(
     games=("Atari-breakout", "Arc-sv01"), agents_per_game=2, num_envs=2, num_steps=3, num_updates=3, batch=4, buffer_size=30, valid_rollouts=1,
     d=4, meta_hidden=8, meta_steps=2, log_interval=1, save_interval=0,
 )
-TINY_SPEC = Spec(((4, 8, 3),), 16, lr=3e-4, lifetimes=(100, 1000))
+TINY_SPEC = Spec(((4, 8, 1),), 16, lr=3e-4, lifetimes=(100, 1000))
 TINY_SPECS = {"Atari-breakout": TINY_SPEC, "Arc-sv01": TINY_SPEC._replace(colors=arc.NUM_COLORS)}
 
 

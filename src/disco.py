@@ -14,14 +14,14 @@ from jax import numpy as jnp
 from checkpoint import fetch_checkpoint, load_checkpoint, save_checkpoint
 from envs import arc, atari, make
 from log import Logger
-from nn import FeedForward, MetaNetwork, RuleInputs, agent_heads, normalize, num_params, take
+from nn import MetaNetwork, Recurrent, RuleInputs, agent_heads, normalize, num_params, take
 from utils import entropy, kl, mixflow_grad, retrace, scale_by_adam_sg_denom, vtrace
 
 
 class Spec(NamedTuple):
-    """A game's agents: the conv torso (per conv: pixel block, features, kernel; see nn.FeedForward), the dense width,
-    the adam learning rate, the lifetimes in env steps they draw from (with probability proportional to 1 / lifetime,
-    so that every lifetime gets the same share of experience), and colors when the frame is color indices to one-hot."""
+    """A game's agents: the conv encoder (per conv: pixel block, features, kernel; see nn.Recurrent), the dense and GRU
+    width, the adam learning rate, the lifetimes in env steps they draw from (with probability proportional to
+    1 / lifetime, so that every lifetime gets the same share of experience), and colors when the frame is color indices."""
 
     convs: tuple[tuple[int, int, int], ...]
     hidden: int
@@ -30,10 +30,10 @@ class Spec(NamedTuple):
     colors: int = 0
 
 
-# the DQN torso (Mnih et al. 2015): 8x8 stride 4, 4x4 stride 2, 3x3 (84 -> 20 -> 9 -> 7); lifetimes: DiscoRL's ratios at 1/20 scale
-ATARI = Spec(((4, 32, 2), (2, 64, 2), (1, 64, 3)), 512, lr=3e-4, lifetimes=(1_000_000, 2_500_000, 5_000_000, 10_000_000))
-# one-hot 64x64 color frames: 12x12 stride 4, 4x4 stride 2, 3x3 (64 -> 14 -> 6 -> 4)
-ARC = Spec(((4, 32, 3), (2, 64, 2), (1, 64, 3)), 512, lr=3e-4, lifetimes=ATARI.lifetimes, colors=arc.NUM_COLORS)
+# patch embeddings as nanodisco's frame stem: 4x4 pixel patches, then 3x3 of those (84 -> 21 -> 7); lifetimes: DiscoRL's ratios at 1/20 scale
+ATARI = Spec(((4, 32, 1), (3, 64, 1)), 512, lr=3e-4, lifetimes=(1_000_000, 2_500_000, 5_000_000, 10_000_000))
+# 64x64 color frames: 4x4 patches of colors, then 2x2 of those (64 -> 16 -> 8)
+ARC = Spec(((4, 32, 1), (2, 64, 1)), 512, lr=3e-4, lifetimes=ATARI.lifetimes, colors=arc.NUM_COLORS)
 SPECS = {f"Atari-{game}": ATARI for game in atari.TRAIN} | {f"Arc-{game}": ARC for game in arc.TRAIN}
 
 
@@ -46,7 +46,6 @@ class Config:
     num_updates: int = 10  # agent updates per meta step, all backpropagated through
     batch: int = 96  # trajectories per agent update
     replay: float = 0.9  # share of the batch from the replay buffer, the rest from the new rollout
-    # shortcut: whole frame stacks are stored (28 KB per step), so the buffer is small; store single frames if it must grow
     buffer_size: int = 10_000  # transitions per agent
     valid_rollouts: int = 6  # rollouts that score the updated agent: 6 x 8 = 48 trajectories, as DiscoRL
     meta_steps: int = 20_000
@@ -82,8 +81,9 @@ class Nets(NamedTuple):
 
     num_actions: int
     obs_space: Any
+    hidden: int  # the GRU width: the agent's carry is (hidden,) per env
     lifetimes: jax.Array
-    new_agent: Any  # new_agent(rngs=...) -> FeedForward with the outputs of nn.agent_heads
+    new_agent: Any  # new_agent(rngs=...) -> nn.Recurrent with the outputs of nn.agent_heads
     new_critic: Any
     graphdef: Any
     critic_graphdef: Any
@@ -100,6 +100,7 @@ class Rollout(NamedTuple):
     reward: jax.Array  # (T, N)
     done: jax.Array  # (T, N): the episode ended at t (terminated or truncated), so obs t + 1 starts another one
     mu: jax.Array  # (T, N, A): the policy that acted
+    carry: jax.Array  # (1, N, hidden): the agent's GRU carry before obs 0, so that learning unrolls from where acting was (R2D2's stored state)
 
 
 class Buffer(NamedTuple):
@@ -124,13 +125,15 @@ class Agent(NamedTuple):
 class Envs(NamedTuple):
     state: Any
     obs: jax.Array
+    carry: jax.Array  # (N, hidden): the agent's GRU carry before obs
 
 
 def inner_loss(graphdef, num_actions: int, cfg: Config, params, targets, data: tuple[Rollout, jax.Array]) -> jax.Array:
     """The agent's loss on a batch: KL to the rule's pi, y and z targets, and a Retrace TD loss for its Q head."""
     pi_hat, y_hat, z_hat, returns = targets
     batch, valid = data
-    logits, y, z, q = agent_heads(nnx.merge(graphdef, params)(batch.obs[:-1]), num_actions, cfg.d, valid)
+    out = nnx.merge(graphdef, params).unroll(batch.carry[0], batch.obs, batch.done)[:-1]
+    logits, y, z, q = agent_heads(out, num_actions, cfg.d, valid)
     loss = kl(pi_hat, logits) + kl(y_hat, y) + kl(z_hat, take(z, batch.action)) + cfg.q_cost * (returns - take(q, batch.action)) ** 2
     return loss.mean()
 
@@ -138,9 +141,9 @@ def inner_loss(graphdef, num_actions: int, cfg: Config, params, targets, data: t
 def make_nets(cfg: Config, env, spec: Spec, num_actions: int) -> Nets:
     obs_space = env.observation_space(None)
     new_agent = partial(
-        FeedForward, num_actions + cfg.d + num_actions * cfg.d + num_actions, obs_space.shape, spec.convs, spec.hidden, colors=spec.colors
+        Recurrent, num_actions + cfg.d + num_actions * cfg.d + num_actions, obs_space.shape, spec.convs, spec.hidden, colors=spec.colors
     )
-    new_critic = partial(FeedForward, 1, obs_space.shape, spec.convs, spec.hidden, colors=spec.colors)
+    new_critic = partial(Recurrent, 1, obs_space.shape, spec.convs, spec.hidden, colors=spec.colors)
     graphdef, _ = nnx.split(new_agent(rngs=nnx.Rngs(0)))
     critic_graphdef, _ = nnx.split(new_critic(rngs=nnx.Rngs(0)))
     agent_tx = optax.chain(scale_by_adam_sg_denom(), optax.clip(cfg.max_abs_update), optax.scale(-spec.lr))
@@ -148,6 +151,7 @@ def make_nets(cfg: Config, env, spec: Spec, num_actions: int) -> Nets:
     return Nets(
         num_actions,
         obs_space,
+        spec.hidden,
         jnp.array(spec.lifetimes),
         new_agent,
         new_critic,
@@ -167,6 +171,7 @@ def init_buffer(nets: Nets, cfg: Config) -> Buffer:
         reward=jnp.zeros((T, n)),
         done=jnp.zeros((T, n), bool),
         mu=jnp.zeros((T, n, nets.num_actions)),
+        carry=jnp.zeros((1, n, nets.hidden)),
     )
     return Buffer(data, jnp.int32(0), jnp.int32(0))
 
@@ -181,9 +186,9 @@ def init_agent(nets: Nets, valid: jax.Array, key: jax.Array) -> Agent:
     return Agent(params, nets.agent_tx.init(params), critic, nets.critic_tx.init(critic), valid, age, lifetime)
 
 
-def init_envs(env, cfg: Config, key: jax.Array) -> Envs:
+def init_envs(nets: Nets, env, cfg: Config, key: jax.Array) -> Envs:
     obs, state = jax.vmap(env.reset, in_axes=(0, None))(jax.random.split(key, cfg.num_envs), None)
-    return Envs(state, obs)
+    return Envs(state, obs, jnp.zeros((cfg.num_envs, nets.hidden)))
 
 
 def act(nets: Nets, cfg: Config, env, params, valid: jax.Array, envs: Envs, key: jax.Array) -> tuple[Rollout, dict, Envs]:
@@ -192,16 +197,19 @@ def act(nets: Nets, cfg: Config, env, params, valid: jax.Array, envs: Envs, key:
 
     def step(envs, key):
         key_action, key_step = jax.random.split(key)
-        logits = agent_heads(model(envs.obs), nets.num_actions, cfg.d, valid)[0]
+        carry, out = model.step(envs.carry, envs.obs)
+        logits = agent_heads(out, nets.num_actions, cfg.d, valid)[0]
         action = jax.random.categorical(key_action, logits)
         next_obs, state, reward, done, info = jax.vmap(env.step, in_axes=(0, 0, 0, None))(
             jax.random.split(key_step, cfg.num_envs), envs.state, action, None
         )
         stats = {"episodes": done.sum(), "score": info["score"].sum()}
-        return Envs(state, next_obs), ((envs.obs, action, reward, done, jax.nn.softmax(logits)), stats)
+        carry = jnp.where(done[:, None], 0.0, carry)  # the next obs starts an episode
+        return Envs(state, next_obs, carry), ((envs.obs, action, reward, done, jax.nn.softmax(logits)), stats)
 
+    first = envs.carry[None]
     envs, (transitions, stats) = jax.lax.scan(step, envs, jax.random.split(key, cfg.num_steps))
-    rollout = Rollout(jnp.concatenate([transitions[0], envs.obs[None]]), *transitions[1:])
+    rollout = Rollout(jnp.concatenate([transitions[0], envs.obs[None]]), *transitions[1:], first)
     return rollout, jax.tree.map(jnp.sum, stats), envs
 
 
@@ -239,11 +247,18 @@ def rule_inputs(cfg: Config, out, traj: Rollout, valid: jax.Array) -> tuple[Rule
     return inputs, returns
 
 
+def critic_values(nets: Nets, critic, batch: Rollout) -> jax.Array:
+    """(T + 1, B) values of the batch's observations. The critic never acts, so it always unrolls from zeros: what it
+    is trained on is what it is used on."""
+    model = nnx.merge(nets.critic_graphdef, critic)
+    return model.unroll(model.initial_carry(batch.obs.shape[1]), batch.obs, batch.done).squeeze(-1)
+
+
 def learn(nets: Nets, cfg: Config, meta_graphdef, meta_params, params, opt_state, batch: Rollout, valid: jax.Array):
     """One agent update towards the meta-network's targets on a batch. Also returns the policy before it (constant) and
     the meta-objective's regulariser on the targets."""
     # y and z carry the meta-gradient back to the params, through this pass
-    out = agent_heads(nnx.merge(nets.graphdef, params)(batch.obs), nets.num_actions, cfg.d, valid)
+    out = agent_heads(nnx.merge(nets.graphdef, params).unroll(batch.carry[0], batch.obs, batch.done), nets.num_actions, cfg.d, valid)
     inputs, returns = rule_inputs(cfg, out, batch, valid)
     pi_hat, y_hat, z_hat = nnx.merge(meta_graphdef, meta_params)(inputs)
     grads = nets.inner_grad(params, (pi_hat, y_hat, z_hat, returns), (batch, valid))
@@ -271,7 +286,7 @@ def agent_update(nets: Nets, cfg: Config, meta_graphdef, env, meta_params, carry
     rho = take(jax.nn.softmax(logits), batch.action) / take(batch.mu, batch.action)
 
     def critic_loss_fn(critic_params):
-        values = nnx.merge(nets.critic_graphdef, critic_params)(batch.obs).squeeze(-1)
+        values = critic_values(nets, critic_params, batch)
         targets, _ = vtrace(jax.lax.stop_gradient(values), batch.reward, cfg.gamma * ~batch.done, rho, cfg.lam)
         return 0.5 * ((targets - values[:-1]) ** 2).mean()
 
@@ -303,9 +318,9 @@ def outer_loss(nets: Nets, cfg: Config, meta_graphdef, env, meta_params, agent: 
     stats = jax.tree.map(lambda s, v: s.sum(0) + v.sum(0), stats, valid_stats)
     # (rollouts, T, N, ...) -> (T, rollouts * N, ...)
     valid = jax.tree.map(lambda x: jnp.moveaxis(x, 0, 1).reshape(x.shape[1], -1, *x.shape[3:]), rollouts)
-    out = agent_heads(nnx.merge(nets.graphdef, agent.params)(valid.obs), nets.num_actions, cfg.d, agent.valid)
+    out = agent_heads(nnx.merge(nets.graphdef, agent.params).unroll(valid.carry[0], valid.obs, valid.done), nets.num_actions, cfg.d, agent.valid)
     logits, y, z, _ = jax.tree.map(lambda x: x[:-1], out)
-    values = nnx.merge(nets.critic_graphdef, agent.critic)(valid.obs).squeeze(-1)
+    values = critic_values(nets, agent.critic, valid)
     rho = jax.lax.stop_gradient(take(jax.nn.softmax(logits), valid.action) / take(valid.mu, valid.action))
     _, advantage = vtrace(values, valid.reward, cfg.gamma * ~valid.done, rho, cfg.lam)
     # normalised per agent, so that games with large values don't dominate the meta-gradient
@@ -331,7 +346,7 @@ def end_of_lifetime(nets: Nets, cfg: Config, env, agent: Agent, buffer: Buffer, 
     fresh = init_agent(nets, agent.valid, key_agent)._replace(age=jnp.int32(0))
     agent = jax.tree.map(lambda f, a: jnp.where(reset, f, a), fresh, agent._replace(age=age))
     buffer = buffer._replace(idx=jnp.where(reset, 0, buffer.idx), size=jnp.where(reset, 0, buffer.size))
-    envs = jax.tree.map(lambda f, e: jnp.where(reset, f, e), init_envs(env, cfg, key_envs), envs)
+    envs = jax.tree.map(lambda f, e: jnp.where(reset, f, e), init_envs(nets, env, cfg, key_envs), envs)
     return agent, buffer, envs, reset
 
 
@@ -361,7 +376,7 @@ def train(cfg: Config, specs: dict[str, Spec] = SPECS):
             agents.append(jax.jit(jax.vmap(partial(init_agent, nets[g])))(valid, jax.random.split(key_agents, per_game)))
             buffers.append(jax.jit(jax.vmap(lambda _: init_buffer(nets[g], cfg)))(jnp.arange(per_game)))
             # under jit, so that leaves that are the same array (atari's obs and its state's frame stack) get buffers of their own for donation
-            envs.append(jax.jit(jax.vmap(partial(init_envs, game, cfg)))(jax.random.split(key_envs, per_game)))
+            envs.append(jax.jit(jax.vmap(partial(init_envs, nets[g], game, cfg)))(jax.random.split(key_envs, per_game)))
         return agents, buffers, envs
 
     def game_step(g: int):
@@ -404,7 +419,8 @@ def train(cfg: Config, specs: dict[str, Spec] = SPECS):
         steps = list(pool.map(lambda g: game_step(g).lower(meta_params, shapes[0][g], shapes[1][g], shapes[2][g], key).compile(), range(len(games))))
     m = [step.memory_analysis() for step in steps]
     print(
-        f"meta step memory: inputs {sum(x.argument_size_in_bytes for x in m) / 2**30:.2f} GB, temporary {max(x.temp_size_in_bytes for x in m) / 2**30:.2f} GB (largest game)"
+        f"meta step memory: inputs {sum(x.argument_size_in_bytes for x in m) / 2**30:.2f} GB, temporary {max(x.temp_size_in_bytes for x in m) / 2**30:.2f} GB (largest game); per game: "
+        + " ".join(f"{name} {x.temp_size_in_bytes / 2**30:.1f}" for name, x in zip(cfg.games, m))
     )
     agents, buffers, envs = init_state()
 

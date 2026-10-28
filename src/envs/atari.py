@@ -1,7 +1,6 @@
 """JAXAtari games (JAX ports of Atari 2600) as our envs, set up like ALE v5: sticky actions 0.25, no no-op starts,
-frame skip 4 with max-pooling, 84x84 grayscale, 4 stacked frames, rewards clipped to their sign, a life lost is not an
-episode end. The engine draws 84x84 grayscale frames itself (jaxtari's native downscaling). Frames are stacked here rather
-than by jaxtari's PixelObsWrapper, which drops the observation before a reset."""
+frame skip 4 with max-pooling, 84x84 grayscale, rewards clipped to their sign, a life lost is not an episode end. The
+engine draws 84x84 grayscale frames itself (jaxtari's native downscaling). Frames are not stacked: the agents have memory."""
 
 import jax
 import jaxtari
@@ -15,13 +14,12 @@ from jaxtari.wrappers import AtariState, AtariWrapper
 # mazes, a digger and a sub; not Fishing Derby (its port takes ~35 ms a step on a GPU, 10x the others)
 TRAIN = ("asterix", "asteroids", "enduro", "freeway", "frostbite", "gopher", "kangaroo", "seaquest")
 HOLDOUT = ("breakout", "pong", "boxing")
-SIZE, FRAME_SKIP, FRAME_STACK = 84, 4, 4
+SIZE, FRAME_SKIP = 84, 4
 
 
 @struct.dataclass
-class StackState:
+class State:
     atari: AtariState
-    obs: jax.Array  # (SIZE, SIZE, FRAME_STACK), oldest frame first
     score: jax.Array  # unclipped return of the episode so far
 
 
@@ -36,15 +34,14 @@ class Atari:
         self.default_params = None
 
     def observation_space(self, params=None):
-        return spaces.Box(0, 255, (SIZE, SIZE, FRAME_STACK), jnp.uint8)
+        return spaces.Box(0, 255, (SIZE, SIZE, 1), jnp.uint8)
 
     def action_space(self, params=None):
         return spaces.Discrete(self.num_actions)
 
     def reset(self, key, params=None):
         _, atari = self.env.reset(key)
-        obs = jnp.repeat(self.env.render(atari.env_state), FRAME_STACK, -1)
-        return obs, StackState(atari, obs, jnp.float32(0))
+        return self.env.render(atari.env_state), State(atari, jnp.float32(0))
 
     def step(self, key, state, action, params=None):
         def skip(atari, _):
@@ -53,13 +50,12 @@ class Atari:
 
         atari, (screens, rewards, terminated, truncated) = jax.lax.scan(skip, state.atari, length=FRAME_SKIP)
         # max over the last two frames, as ALE does against sprite flicker
-        frame = jnp.maximum(*(self.env.render(jax.tree.map(lambda x: x[i], screens)) for i in (-2, -1)))
-        obs = jnp.concatenate([state.obs[..., 1:], frame], -1)
+        obs = jnp.maximum(*(self.env.render(jax.tree.map(lambda x: x[i], screens)) for i in (-2, -1)))
         reward, terminated, truncated = rewards.sum().astype(jnp.float32), terminated.any(), truncated.any()
         done = terminated | truncated
         score = state.score + reward
         # score is reported on the step an episode ends, like craftax's achievements
         info = {"terminated": terminated, "truncated": truncated, "final_observation": obs, "score": score * done}
         reset_obs, reset_state = self.reset(atari.key)
-        obs, state = jax.tree.map(lambda r, x: jnp.where(done, r, x), (reset_obs, reset_state), (obs, StackState(atari, obs, score)))
+        obs, state = jax.tree.map(lambda r, x: jnp.where(done, r, x), (reset_obs, reset_state), (obs, State(atari, score)))
         return obs, state, jnp.sign(reward), done, info

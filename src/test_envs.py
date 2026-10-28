@@ -72,7 +72,7 @@ def test_random_rollouts():
 
 
 def test_atari_keeps_the_final_observation():
-    """When an episode ends, info holds its last stack and obs is a reset stack (one frame repeated)."""
+    """When an episode ends, info holds its last frame and obs is the new episode's first; otherwise they are the same frame."""
     env, params = make("Atari-breakout")
     num_envs = 8
 
@@ -91,8 +91,8 @@ def test_atari_keeps_the_final_observation():
 
     obs, next_obs, done, info = run(jax.random.key(0))
     assert done.any(), "no breakout episode ended in 300 random steps"
-    assert (info["final_observation"][..., :-1] == obs[..., 1:]).all()
-    assert (next_obs[done][..., :-1] == next_obs[done][..., 1:]).all()
+    assert obs.shape[2:] == (84, 84, 1) and obs.dtype == jnp.uint8
+    assert (info["final_observation"][~done] == next_obs[~done]).all()
     assert (info["score"][~done] == 0).all() and (info["score"][done] >= 0).all()
 
 
