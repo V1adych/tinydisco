@@ -348,15 +348,17 @@ def train(cfg: Config, specs: dict[str, Spec] = SPECS):
     meta_tx = optax.chain(optax.clip_by_global_norm(cfg.max_grad_norm), optax.adam(cfg.meta_lr))
     meta_opt_state = jax.vmap(lambda _: meta_tx.init(meta_params))(jnp.arange(num_agents))
     key = jax.random.key(cfg.seed)
-    # per game: its agents, their buffers and envs, each with a leading axis over the game's agents
-    agents, buffers, envs = [], [], []
-    for g, game in enumerate(games):
-        key_agents, key_envs = jax.random.split(jax.random.fold_in(key, g))
-        valid = jnp.broadcast_to(jnp.arange(num_actions) < game.num_actions, (per_game, num_actions))
-        agents.append(jax.jit(jax.vmap(partial(init_agent, nets[g])))(valid, jax.random.split(key_agents, per_game)))
-        buffers.append(jax.jit(jax.vmap(lambda _: init_buffer(nets[g], cfg)))(jnp.arange(per_game)))
-        # under jit, so that leaves that are the same array (atari's obs and its state's frame stack) get buffers of their own for donation
-        envs.append(jax.jit(jax.vmap(partial(init_envs, game, cfg)))(jax.random.split(key_envs, per_game)))
+    def init_state():
+        """Per game: its agents, their buffers and envs, each with a leading axis over the game's agents."""
+        agents, buffers, envs = [], [], []
+        for g, game in enumerate(games):
+            key_agents, key_envs = jax.random.split(jax.random.fold_in(key, g))
+            valid = jnp.broadcast_to(jnp.arange(num_actions) < game.num_actions, (per_game, num_actions))
+            agents.append(jax.jit(jax.vmap(partial(init_agent, nets[g])))(valid, jax.random.split(key_agents, per_game)))
+            buffers.append(jax.jit(jax.vmap(lambda _: init_buffer(nets[g], cfg)))(jnp.arange(per_game)))
+            # under jit, so that leaves that are the same array (atari's obs and its state's frame stack) get buffers of their own for donation
+            envs.append(jax.jit(jax.vmap(partial(init_envs, game, cfg)))(jax.random.split(key_envs, per_game)))
+        return agents, buffers, envs
 
     @partial(jax.jit, donate_argnums=(2, 3, 4))
     def meta_step(meta_params, meta_opt_state, agents, buffers, envs, key):
@@ -391,9 +393,11 @@ def train(cfg: Config, specs: dict[str, Spec] = SPECS):
         f"{run_name}: meta-network {num_params(nnx.merge(meta_graphdef, meta_params)):,} params, {len(games)} games x {per_game} agents, {steps_per_meta_step:,} env steps per meta step"
     )
 
-    meta_step = meta_step.lower(meta_params, meta_opt_state, agents, buffers, envs, key).compile()
+    # compiled on the state's shapes before the state exists, so that the compile (cudnn's autotuning) has the whole GPU
+    meta_step = meta_step.lower(meta_params, meta_opt_state, *jax.eval_shape(init_state), key).compile()
     m = meta_step.memory_analysis()
     print(f"meta step memory: inputs {m.argument_size_in_bytes / 2**30:.2f} GB, temporary {m.temp_size_in_bytes / 2**30:.2f} GB")
+    agents, buffers, envs = init_state()
 
     totals, last_time, last_step = None, time.perf_counter(), start
     for i in range(start + 1, cfg.meta_steps + 1):
