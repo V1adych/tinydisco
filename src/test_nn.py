@@ -12,7 +12,7 @@ def test_agent_heads():
     env, params = make("Atari-breakout")
     obs, _ = jax.vmap(env.reset, in_axes=(0, None))(jax.random.split(jax.random.key(0), 5), params)
     num_actions, d = env.num_actions, 8
-    agent = FeedForward(num_actions + d + num_actions * d + num_actions, nnx.Rngs(0))
+    agent = FeedForward(num_actions + d + num_actions * d + num_actions, obs.shape[1:], nnx.Rngs(0))
     valid = jnp.arange(num_actions) < 2
     logits, y, z, q = agent_heads(agent(obs), num_actions, d, valid)
     assert logits.shape == (5, num_actions) and y.shape == (5, d) and z.shape == (5, num_actions, d) and q.shape == (5, num_actions)
@@ -22,7 +22,7 @@ def test_agent_heads():
 
 def test_block_convs_are_the_strided_convs():
     """A 2x2 conv over k x k blocks equals the k*2 x k*2 stride-k conv whose kernel is the block conv's, unfolded."""
-    net = FeedForward(1, nnx.Rngs(0))
+    net = FeedForward(1, (84, 84, 4), nnx.Rngs(0))
     x = jax.random.normal(jax.random.key(1), (3, 84, 84, 4))
     for conv, k in zip(net.convs[:2], FeedForward.BLOCKS):
         kernel, c = conv.kernel.value, conv.in_features // (k * k)
@@ -31,6 +31,13 @@ def test_block_convs_are_the_strided_convs():
         blocks = jax.lax.conv_general_dilated(space_to_depth(x, k), kernel, (1, 1), "VALID", dimension_numbers=("NHWC", "HWIO", "NHWC")) + conv.bias.value
         assert jnp.allclose(strided, blocks, atol=1e-4), f"block conv {k} differs from the strided conv"
         x = jax.random.normal(jax.random.key(2), (3, 20, 20, 32))
+
+
+def test_arc_torso():
+    env, _ = make("Arc-ls20")
+    obs, _ = jax.vmap(env.reset)(jax.random.split(jax.random.key(0), 3))
+    out = FeedForward(7, obs.shape[1:], nnx.Rngs(0))(obs)
+    assert out.shape == (3, 7) and out.dtype == jnp.float32
 
 
 def rule_inputs(reward):
@@ -87,6 +94,7 @@ def test_meta_ignores_padded_actions():
 if __name__ == "__main__":
     test_agent_heads()
     test_block_convs_are_the_strided_convs()
+    test_arc_torso()
     test_meta_looks_only_ahead_within_an_episode()
     test_meta_serves_any_number_of_actions()
     test_meta_ignores_padded_actions()

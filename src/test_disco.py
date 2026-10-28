@@ -11,7 +11,7 @@ from disco import Config, init_buffer, make_nets, sample, store, train
 from envs import make
 
 TINY = Config(
-    games=("breakout", "pong"), agents_per_game=2, num_envs=2, num_steps=3, num_updates=3, batch=4, buffer_size=30, valid_rollouts=1,
+    games=("Atari-breakout", "Atari-pong"), agents_per_game=2, num_envs=2, num_steps=3, num_updates=3, batch=4, buffer_size=30, valid_rollouts=1,
     lifetimes=(100, 1000), d=4, meta_hidden=8, meta_steps=2, log_interval=1, save_interval=0,
 )
 
@@ -42,7 +42,7 @@ def test_meta_steps_run():
 
 def test_resume_restores_meta_network():
     with tempfile.TemporaryDirectory() as tmp:
-        cfg = replace(TINY, games=("breakout",), meta_steps=1, save_interval=1, checkpoint_dir=tmp, run_name="r")
+        cfg = replace(TINY, games=("Atari-breakout",), meta_steps=1, save_interval=1, checkpoint_dir=tmp, run_name="r")
         trained = jax.tree.leaves(nnx.state(train(cfg)))
         resumed = jax.tree.leaves(nnx.state(train(replace(cfg, meta_steps=0, resume=f"{tmp}/r/1"))))
     assert all(jnp.array_equal(a, b) for a, b in zip(trained, resumed)), "resume did not restore the trained meta-network"

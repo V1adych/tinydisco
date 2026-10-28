@@ -20,7 +20,7 @@ from utils import entropy, kl, mixflow_grad, retrace, scale_by_adam_sg_denom, vt
 
 @dataclass(frozen=True)
 class Config:
-    games: tuple[str, ...] = TRAIN_GAMES
+    games: tuple[str, ...] = tuple(f"Atari-{game}" for game in TRAIN_GAMES)  # envs.make names; one observation shape
     agents_per_game: int = 1
     num_envs: int = 8  # per agent
     num_steps: int = 29  # T of a rollout
@@ -121,8 +121,8 @@ def make_nets(cfg: Config, envs: list) -> Nets:
     num_actions = max(env.num_actions for env in envs)
     obs_space = envs[0].observation_space(None)
     assert all(env.observation_space(None).shape == obs_space.shape for env in envs), "the games must share an observation shape"
-    new_agent = partial(FeedForward, num_actions + cfg.d + num_actions * cfg.d + num_actions)
-    new_critic = partial(FeedForward, 1)
+    new_agent = partial(FeedForward, num_actions + cfg.d + num_actions * cfg.d + num_actions, obs_space.shape)
+    new_critic = partial(FeedForward, 1, obs_space.shape)
     graphdef, _ = nnx.split(new_agent(rngs=nnx.Rngs(0)))
     critic_graphdef, _ = nnx.split(new_critic(rngs=nnx.Rngs(0)))
     agent_tx = optax.chain(scale_by_adam_sg_denom(), optax.clip(cfg.max_abs_update), optax.scale(-cfg.lr))
@@ -315,7 +315,7 @@ def end_of_lifetime(nets: Nets, cfg: Config, env, agent: Agent, buffer: Buffer, 
 def train(cfg: Config):
     run_name = cfg.run_name or f"disco_s{cfg.seed}_{time.strftime('%Y%m%d-%H%M%S')}"
     logger = Logger(cfg, cfg.wandb_project, run_name, cfg.track)  # first, so that wandb records the console of a crash during setup
-    games = [make(f"Atari-{game}")[0] for game in cfg.games]
+    games = [make(game)[0] for game in cfg.games]
     nets = make_nets(cfg, games)
     num_agents, per_game = len(games) * cfg.agents_per_game, cfg.agents_per_game
     meta_network, start = MetaNetwork(cfg.d, cfg.meta_hidden, nnx.Rngs(cfg.seed)), 0

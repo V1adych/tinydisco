@@ -17,3 +17,11 @@ dependencies = [
     "ipywidgets>=8.1.9",
     "jaxtari>=0.2.0",
 ]
+
+[dependency-groups]
+dev = [
+    "arcengine",
+]
+
+[tool.uv.sources]
+arcengine = { git = "https://github.com/arcprize/ARCEngine" }

@@ -8,3 +8,5 @@ try_wandb.py
 .venv/
 artifacts/
 profiling/
+.claude/
+src/envs/arc/originals/
