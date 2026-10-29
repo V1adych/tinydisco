@@ -12,7 +12,7 @@ from jaxtari.wrappers import AtariState, AtariWrapper
 
 # 8 of jaxtari's 🥇 games (statuses from jaxtari's games_covered.md): a shooter, a driver, a crosser, a platformer, two
 # mazes, a digger and a sub; not Fishing Derby (its port takes ~35 ms a step on a GPU, 10x the others)
-TRAIN = ("asterix", "asteroids", "enduro", "freeway", "frostbite", "gopher", "kangaroo", "seaquest")
+TRAIN = ("asterix", "asteroids", "mspacman", "beamrider", "frostbite", "gopher", "kangaroo", "seaquest")
 HOLDOUT = ("breakout", "pong", "boxing")
 SIZE, FRAME_SKIP = 84, 4
 
