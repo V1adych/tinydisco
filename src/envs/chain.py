@@ -19,6 +19,7 @@ CHAINS = {
 class ChainState(environment.EnvState):
     correct: jax.Array  # the action that pays +1 when the chain ends
     chose_correctly: jax.Array
+    score: jax.Array  # return of the episode so far, in info every step: it is the episode's score on the step it ends
 
 
 @struct.dataclass
@@ -51,11 +52,12 @@ class DelayedChain(environment.Environment[ChainState, ChainParams]):
         end = state.time >= params.chain_length
         between = 2.0 * jax.random.bernoulli(key_noise) - 1 if self.noisy else 0.0
         reward = jnp.where(end, 2.0 * chose_correctly - 1, between)
-        return self.get_obs(state, params, key_obs), state, reward, end, {}
+        state = state.replace(score=state.score + reward)
+        return self.get_obs(state, params, key_obs), state, reward, end, {"score": state.score}
 
     def reset_env(self, key, params: ChainParams):
         key_correct, key_obs = jax.random.split(key)
-        state = ChainState(time=jnp.int32(0), correct=jax.random.randint(key_correct, (), 0, 2), chose_correctly=jnp.array(False))
+        state = ChainState(time=jnp.int32(0), correct=jax.random.randint(key_correct, (), 0, 2), chose_correctly=jnp.array(False), score=jnp.float32(0))
         return self.get_obs(state, params, key_obs), state
 
     def get_obs(self, state: ChainState, params=None, key=None):

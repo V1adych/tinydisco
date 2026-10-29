@@ -34,7 +34,12 @@ class Spec(NamedTuple):
 ATARI = Spec(((4, 32), (3, 64)), 512, lr=3e-4, lifetimes=(1_000_000, 2_500_000, 5_000_000, 10_000_000))
 # 64x64 color frames: 4x4 patches of colors, then 2x2 of those (64 -> 16 -> 8)
 ARC = Spec(((4, 32), (2, 64)), 512, lr=3e-4, lifetimes=ATARI.lifetimes, colors=arc.NUM_COLORS)
-SPECS = {f"Atari-{game}": ATARI for game in atari.TRAIN} | {f"Arc-{game}": ARC for game in arc.TRAIN}
+# LPG's grid worlds and delayed chains: no patch layers (the grids don't split into patches), a small network so they
+# cost little, and lifetimes short enough that agents are still learning (a chain episode is 5 to 50 steps)
+# shortcut: lifetimes are a guess, check when a fresh agent's score stops rising
+TOY = Spec((), 32, lr=3e-4, lifetimes=(50_000, 100_000, 200_000, 500_000))
+TOY_TRAIN = ("Grid-dense", "Grid-long_horizon", "Grid-small_sparse", "Chain-long_noisy", "Chain-distraction")
+SPECS = {f"Atari-{game}": ATARI for game in atari.TRAIN} | {f"Arc-{game}": ARC for game in arc.TRAIN} | dict.fromkeys(TOY_TRAIN, TOY)
 
 
 @dataclass(frozen=True)
@@ -203,7 +208,7 @@ def act(nets: Nets, cfg: Config, env, params, valid: jax.Array, envs: Envs, key:
         next_obs, state, reward, done, info = jax.vmap(env.step, in_axes=(0, 0, 0, None))(
             jax.random.split(key_step, cfg.num_envs), envs.state, action, None
         )
-        stats = {"episodes": done.sum(), "score": info["score"].sum()}
+        stats = {"episodes": done.sum(), "score": (info["score"] * done).sum()}  # an env's score counts on the step its episode ends
         carry = jnp.where(done[:, None], 0.0, carry)  # the next obs starts an episode
         return Envs(state, next_obs, carry), ((envs.obs, action, reward, done, jax.nn.softmax(logits)), stats)
 

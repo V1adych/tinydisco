@@ -19,17 +19,20 @@ def test_chain_pays_for_the_first_action():
             for t in range(7):
                 # later actions are deliberately the wrong one: they must not matter
                 action = first if t == 0 else 1 - state.correct
-                _, state, reward, done, _ = env.step(jax.random.key(t + 1), state, action, params)
+                _, state, reward, done, info = env.step(jax.random.key(t + 1), state, action, params)
                 rewards.append(float(reward))
                 assert bool(done) == (t == 6), (variant, t)
             assert rewards[-1] == (1.0 if first_correct else -1.0), variant
+            assert float(info["score"]) == sum(rewards) and float(state.score) == 0.0, "the score is the episode's return, then restarts"
             if "noisy" not in variant:
                 assert rewards[:-1] == [0.0] * 6, variant
 
 
 def test_grid_collects():
     key = jax.random.key(0)
-    state = GridState(time=jnp.int32(0), agent=jnp.array([0, 0]), objects=jnp.array([[0, 1], [5, 5], [6, 6], [7, 7]]), active=jnp.ones(4, bool))
+    state = GridState(
+        time=jnp.int32(0), agent=jnp.array([0, 0]), objects=jnp.array([[0, 1], [5, 5], [6, 6], [7, 7]]), active=jnp.ones(4, bool), score=jnp.float32(0)
+    )
     right = 5  # MOVES[5] is (0, 1)
 
     env, params = make("Grid-dense")
@@ -55,18 +58,23 @@ def test_random_rollouts():
             obs, state = jax.vmap(env.reset, in_axes=(0, None))(jax.random.split(key, num_envs), params)
 
             def body(carry, key):
-                state, _ = carry
+                state, _, ret = carry
                 key_action, key_step = jax.random.split(key)
                 action = jax.random.randint(key_action, (num_envs,), 0, env.num_actions)
-                obs, state, reward, done, _ = jax.vmap(env.step, in_axes=(0, 0, 0, None))(jax.random.split(key_step, num_envs), state, action, params)
-                return (state, obs), (reward, done)
+                obs, state, reward, done, info = jax.vmap(env.step, in_axes=(0, 0, 0, None))(jax.random.split(key_step, num_envs), state, action, params)
+                # grid's and chain's score, on the step an episode ends (terminated or cut by the time limit), is the episode's return
+                ret = ret + reward
+                score = info["score"] if name.startswith(("Grid", "Chain")) else ret
+                score_ok = jnp.where(done, score == ret, True).all()
+                return (state, obs, jnp.where(done, 0.0, ret)), (reward, done, score_ok)
 
-            (_, obs), (reward, done) = jax.lax.scan(body, (state, obs), jax.random.split(key, num_steps))
-            return obs, reward, done
+            (_, obs, _), (reward, done, score_ok) = jax.lax.scan(body, (state, obs, jnp.zeros(num_envs)), jax.random.split(key, num_steps))
+            return obs, reward, done, score_ok.all()
 
-        obs, reward, done = run(jax.random.key(0))
+        obs, reward, done, score_ok = run(jax.random.key(0))
         assert obs.shape == (num_envs, *env.observation_space(params).shape), name
         assert jnp.isfinite(obs).all() and jnp.isfinite(reward).all(), name
+        assert score_ok, f"{name}: the score at an episode's end is not its return"
         # random craftax agents rarely die within a short test
         assert done.any() or name.startswith("Craftax"), f"{name}: no episode ended in {num_steps} steps"
 

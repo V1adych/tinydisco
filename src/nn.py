@@ -1,3 +1,4 @@
+import math
 from typing import NamedTuple
 
 import jax
@@ -60,23 +61,23 @@ class Recurrent(nnx.Module):
 
     def __init__(self, num_outputs: int, obs_shape: tuple[int, ...], convs: tuple[tuple[int, int], ...], hidden: int, rngs: nnx.Rngs, colors: int = 0):
         bf16 = dict(dtype=jnp.bfloat16, param_dtype=jnp.float32, rngs=rngs)
-        h, w, c = obs_shape
-        self.colors, self.blocks, self.layers = colors, tuple(k for k, _ in convs), nnx.List()
-        c = colors or c
+        self.colors, self.blocks, self.layers, self.obs_ndim = colors, tuple(k for k, _ in convs), nnx.List(), len(obs_shape)
+        shape = (*obs_shape[:-1], colors or obs_shape[-1])
         for k, features in convs:
+            h, w, c = shape
             assert h % k == 0 and w % k == 0, f"a {h}x{w} map does not split into {k}x{k} blocks"
             self.layers.append(nnx.Linear(c * k * k, features, **bf16))
-            h, w, c = h // k, w // k, features
-        self.dense = nnx.Linear(h * w * c, hidden, **bf16)
+            shape = (h // k, w // k, features)
+        self.dense = nnx.Linear(int(math.prod(shape)), hidden, **bf16)
         self.gru = nnx.GRUCell(hidden, hidden, rngs=rngs)
         self.out = nnx.Linear(hidden, num_outputs, kernel_init=nnx.initializers.normal(1e-2), rngs=rngs)
 
     def encode(self, obs: jax.Array) -> jax.Array:
-        """(B, H, W, C) frames -> (B, hidden) float32 features."""
+        """(B, *obs_shape) observations -> (B, hidden) float32 features."""
         x = jax.nn.one_hot(obs.squeeze(-1), self.colors, dtype=jnp.bfloat16) if self.colors else to_float(obs)
         for layer, k in zip(self.layers, self.blocks):
             x = nnx.relu(layer(space_to_depth(x, k)))
-        return nnx.relu(self.dense(x.reshape(*x.shape[:-3], -1))).astype(jnp.float32)
+        return nnx.relu(self.dense(x.reshape(*x.shape[: x.ndim - self.obs_ndim], -1))).astype(jnp.float32)
 
     def step(self, carry: jax.Array, obs: jax.Array) -> tuple[jax.Array, jax.Array]:
         """One step of a batch: the carry (B, hidden) after the frames (B, H, W, C), and the output (B, num_outputs)."""

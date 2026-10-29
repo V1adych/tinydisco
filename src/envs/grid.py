@@ -24,6 +24,7 @@ class GridState(environment.EnvState):
     agent: jax.Array  # (2,) row, column
     objects: jax.Array  # (K, 2)
     active: jax.Array  # (K,) whether each object is on the board
+    score: jax.Array  # return of the episode so far, in info every step: it is the episode's score on the step it ends
 
 
 class GridWorld(environment.Environment[GridState, environment.EnvParams]):
@@ -62,12 +63,13 @@ class GridWorld(environment.Environment[GridState, environment.EnvParams]):
         respawn = ~state.active & jax.random.bernoulli(key_respawn, self.p_respawn)
         # shortcut: a respawned object may land on the agent or another object, as nothing in LPG's appendix rules it out
         objects = jnp.where(respawn[:, None], self.cells(key_cells, len(self.kind), replace=True), state.objects)
-        state = GridState(time=state.time + 1, agent=agent, objects=objects, active=(state.active & ~collected) | respawn)
-        return self.get_obs(state), state, reward, terminated, {}
+        active = (state.active & ~collected) | respawn
+        state = GridState(time=state.time + 1, agent=agent, objects=objects, active=active, score=state.score + reward)
+        return self.get_obs(state), state, reward, terminated, {"score": state.score}
 
     def reset_env(self, key, params):
         cells = self.cells(key, len(self.kind) + 1, replace=False)
-        state = GridState(time=jnp.int32(0), agent=cells[0], objects=cells[1:], active=jnp.ones(len(self.kind), bool))
+        state = GridState(time=jnp.int32(0), agent=cells[0], objects=cells[1:], active=jnp.ones(len(self.kind), bool), score=jnp.float32(0))
         return self.get_obs(state), state
 
     def get_obs(self, state: GridState, params=None, key=None):
