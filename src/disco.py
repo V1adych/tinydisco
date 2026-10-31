@@ -31,9 +31,9 @@ class Spec(NamedTuple):
 
 
 # patch embeddings as nanodisco's frame stem: 4x4 pixel patches, then 3x3 of those (84 -> 21 -> 7); lifetimes: DiscoRL's ratios at 1/20 scale
-ATARI = Spec(((4, 32), (3, 64)), 512, lr=3e-4, lifetimes=(5_000_000, 12_500_000, 10_000_000, 20_000_000))
+ATARI = Spec(((4, 32), (3, 64)), 256, lr=3e-4, lifetimes=(5_000_000, 12_500_000, 10_000_000, 20_000_000))
 # 64x64 color frames: 4x4 patches of colors, then 2x2 of those (64 -> 16 -> 8)
-ARC = Spec(((4, 32), (2, 64)), 512, lr=3e-4, lifetimes=ATARI.lifetimes, colors=arc.NUM_COLORS)
+ARC = Spec(((4, 32), (2, 64)), 256, lr=3e-4, lifetimes=ATARI.lifetimes, colors=arc.NUM_COLORS)
 # LPG's grid worlds and delayed chains: no patch layers (the grids don't split into patches), a small network so they
 # cost little, and lifetimes short enough that agents are still learning (a chain episode is 5 to 50 steps)
 # shortcut: lifetimes are a guess, check when a fresh agent's score stops rising
