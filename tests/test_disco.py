@@ -21,7 +21,9 @@ TINY_SPECS = {"Atari-breakout": TINY_SPEC, "Arc-sv01": TINY_SPEC._replace(colors
 def test_buffer_wraps_and_samples_the_new_rollout():
     """Rollouts overwrite the oldest trajectories, and the last update's batch without replay holds only the rollout stored last."""
     cfg = replace(TINY, buffer_size=5 * TINY.num_steps, replay=0.0, batch=8)  # room for 5 trajectories, 2 per rollout
-    buffer = init_buffer(make_nets(cfg, make("Atari-breakout")[0], TINY_SPEC, 4), cfg)
+    env, _ = make("Atari-breakout")
+    buffer = init_buffer(make_nets(cfg, env, TINY_SPEC), cfg)
+    assert buffer.data.mu.shape[-1] == env.num_actions
     for k in range(3):  # rollout k into slots 2k and 2k + 1: rollout 2 into slots 4 and 0, over rollout 0's first
         rollout = jax.tree.map(lambda x: x[:, : cfg.num_envs], buffer.data)._replace(reward=jnp.full((cfg.num_steps, cfg.num_envs), k, jnp.float32))
         buffer = store(buffer, rollout)
@@ -35,7 +37,7 @@ def test_buffer_wraps_and_samples_the_new_rollout():
 
 
 def test_critic_learns_without_changing_actor_features():
-    nets = make_nets(TINY, make("Atari-breakout")[0], TINY_SPEC, 4)
+    nets = make_nets(TINY, make("Atari-breakout")[0], TINY_SPEC)
     _, critic = nnx.split(nets.new_critic(rngs=nnx.Rngs(0)))
     assert sum(x.size for x in jax.tree.leaves(critic)) == TINY_SPEC.hidden + 1
     features = jax.random.normal(jax.random.key(1), (TINY.num_steps + 1, TINY.num_envs, TINY_SPEC.hidden))
