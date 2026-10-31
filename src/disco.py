@@ -283,8 +283,8 @@ def agent_update(nets: Nets, cfg: Config, meta_graphdef, env, meta_params, carry
     rollout, stats, envs = act(nets, cfg, env, jax.lax.stop_gradient(agent.params), agent.valid, envs, key_act)
     buffer = store(buffer, rollout)
     batch, ready = sample(cfg, buffer, key_sample)
-    params, opt_state, logits, reg, pi_hat_entropy, features = jax.checkpoint(partial(learn, nets, cfg, meta_graphdef))(
-        meta_params, agent.params, agent.opt_state, batch, agent.valid
+    params, opt_state, logits, reg, pi_hat_entropy, features = learn(
+        nets, cfg, meta_graphdef, meta_params, agent.params, agent.opt_state, batch, agent.valid
     )
 
     # the critic learns the values of the policy before the update, by V-trace; it never carries the meta-gradient
