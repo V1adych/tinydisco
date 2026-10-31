@@ -53,7 +53,7 @@ class Config:
     replay: float = 0.9  # share of the batch from the replay buffer, the rest from the new rollout
     buffer_size: int = 10_000  # transitions per agent
     valid_rollouts: int = 6  # rollouts that score the updated agent: 6 x 8 = 48 trajectories, as DiscoRL
-    meta_steps: int = 20_000
+    meta_steps: int = 5000
     seed: int = 0
     gamma: float = 0.997  # DiscoRL's on Atari
     lam: float = 0.95  # trace decay of Retrace and V-trace
@@ -73,7 +73,7 @@ class Config:
     pi_hat_kl_coef: float = 1e-2  # KL(pi || pi_hat): keeps the policy targets near the current policy
     # logging
     log_interval: int = 10  # in meta steps
-    save_interval: int = 1000  # in meta steps, 0 disables checkpoints
+    save_interval: int = 200  # in meta steps, 0 disables checkpoints
     checkpoint_dir: str = "checkpoints"
     resume: str | None = None  # continue from a checkpoint directory or wandb artifact at its step; optimizer state and agents start fresh
     track: bool = False
