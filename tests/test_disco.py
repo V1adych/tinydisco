@@ -2,12 +2,13 @@
 
 import tempfile
 from dataclasses import replace
+from functools import partial
 
 import jax
 from flax import nnx
 from jax import numpy as jnp
 
-from disco import Config, Spec, critic_values, init_buffer, make_nets, sample, store, train
+from disco import Config, Spec, critic_values, init_buffer, make_nets, pack_obs, sample, store, train, unpack_obs
 from envs import arc, make
 
 TINY = Config(
@@ -22,18 +23,45 @@ def test_buffer_wraps_and_samples_the_new_rollout():
     """Rollouts overwrite the oldest trajectories, and the last update's batch without replay holds only the rollout stored last."""
     cfg = replace(TINY, buffer_size=5 * TINY.num_steps, replay=0.0, batch=8)  # room for 5 trajectories, 2 per rollout
     env, _ = make("Atari-breakout")
-    buffer = init_buffer(make_nets(cfg, env, TINY_SPEC), cfg)
+    nets = make_nets(cfg, env, TINY_SPEC)
+    buffer = init_buffer(nets, cfg)
     assert buffer.data.mu.shape[-1] == env.num_actions
     for k in range(3):  # rollout k into slots 2k and 2k + 1: rollout 2 into slots 4 and 0, over rollout 0's first
         rollout = jax.tree.map(lambda x: x[:, : cfg.num_envs], buffer.data)._replace(reward=jnp.full((cfg.num_steps, cfg.num_envs), k, jnp.float32))
-        buffer = store(buffer, rollout)
+        buffer = store(nets, buffer, rollout)
     assert buffer.size == 5 and buffer.idx == 1
     assert jnp.array_equal(buffer.data.reward[0], jnp.array([2, 0, 1, 1, 2], jnp.float32))
-    batch, ready = sample(cfg, buffer, jax.random.key(0))
+    batch, ready = sample(nets, cfg, buffer, jax.random.key(0))
     assert batch.obs.shape[:2] == (cfg.num_steps + 1, 8) and batch.reward.shape == (cfg.num_steps, 8) and not ready
     assert (batch.reward == 2).all(), "the new share must come from the rollout stored last"
-    batch, _ = sample(replace(cfg, replay=1.0), buffer, jax.random.key(0))
+    batch, _ = sample(nets, replace(cfg, replay=1.0), buffer, jax.random.key(0))
     assert set(batch.reward[0].tolist()) == {0.0, 1.0, 2.0}, "the replay share must come from the whole buffer"
+
+
+def test_packed_replay_matches_unpacked_after_wrap_and_reset():
+    cfg = replace(TINY, buffer_size=5 * TINY.num_steps)
+    nets = make_nets(cfg, make("Arc-sv01")[0], TINY_SPECS["Arc-sv01"])
+    raw_nets = nets._replace(colors=0)
+    packed, raw = init_buffer(nets, cfg), init_buffer(raw_nets, cfg)
+    assert packed.data.obs.nbytes * 2 == raw.data.obs.nbytes
+    # Every possible pair of 4-bit colors, including zeros and 15s.
+    bytes_ = jnp.arange(256, dtype=jnp.uint8).reshape(2, 1, 8, 16, 1)
+    assert jnp.array_equal(pack_obs(unpack_obs(bytes_)), bytes_)
+    for k in range(6):
+        if k == 3:  # A lifetime reset leaves stale storage behind.
+            packed = packed._replace(idx=jnp.int32(0), size=jnp.int32(0))
+            raw = raw._replace(idx=jnp.int32(0), size=jnp.int32(0))
+        rollout = jax.tree.map(lambda x: x[:, :cfg.num_envs], raw.data)
+        obs = (jnp.arange(rollout.obs.size).reshape(rollout.obs.shape) + k) % 16
+        rollout = rollout._replace(obs=obs.astype(jnp.uint8), reward=jnp.full_like(rollout.reward, k))
+        packed = jax.jit(partial(store, nets))(packed, rollout)
+        raw = store(raw_nets, raw, rollout)
+        assert jnp.array_equal(unpack_obs(packed.data.obs), raw.data.obs)
+        for replay in (0.0, 0.9, 1.0):
+            sample_cfg = replace(cfg, replay=replay)
+            actual = jax.jit(partial(sample, nets, sample_cfg))(packed, jax.random.key(k))
+            expected = sample(raw_nets, sample_cfg, raw, jax.random.key(k))
+            assert all(jnp.array_equal(a, b) for a, b in zip(jax.tree.leaves(actual), jax.tree.leaves(expected)))
 
 
 def test_critic_learns_without_changing_actor_features():
@@ -71,6 +99,7 @@ def test_resume_restores_meta_network():
 
 if __name__ == "__main__":
     test_buffer_wraps_and_samples_the_new_rollout()
+    test_packed_replay_matches_unpacked_after_wrap_and_reset()
     test_critic_learns_without_changing_actor_features()
     test_meta_steps_run()
     test_resume_restores_meta_network()

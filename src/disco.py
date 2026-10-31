@@ -51,7 +51,7 @@ class Config:
     num_updates: int = 10  # agent updates per meta step, all backpropagated through
     batch: int = 96  # trajectories per agent update
     replay: float = 0.9  # share of the batch from the replay buffer, the rest from the new rollout
-    buffer_size: int = 10_000  # transitions per agent
+    buffer_size: int = 32_768  # transitions per agent, rounded down to whole trajectories
     valid_rollouts: int = 6  # rollouts that score the updated agent: 6 x 8 = 48 trajectories, as DiscoRL
     meta_steps: int = 5000
     seed: int = 0
@@ -86,6 +86,7 @@ class Nets(NamedTuple):
 
     num_actions: int
     obs_space: Any
+    colors: int
     hidden: int  # the GRU width: the agent's carry is (hidden,) per env
     lifetimes: jax.Array
     new_agent: Any  # new_agent(rngs=...) -> nn.Recurrent with the outputs of nn.agent_heads
@@ -109,7 +110,7 @@ class Rollout(NamedTuple):
 
 
 class Buffer(NamedTuple):
-    data: Rollout  # with capacity in place of N
+    data: Rollout  # with capacity in place of N; ARC observations store two color indices per byte
     idx: jax.Array  # where the next trajectories go
     size: jax.Array  # trajectories stored
 
@@ -155,6 +156,7 @@ def make_nets(cfg: Config, env, spec: Spec) -> Nets:
     return Nets(
         num_actions,
         obs_space,
+        spec.colors,
         spec.hidden,
         jnp.array(spec.lifetimes),
         new_agent,
@@ -169,8 +171,12 @@ def make_nets(cfg: Config, env, spec: Spec) -> Nets:
 
 def init_buffer(nets: Nets, cfg: Config) -> Buffer:
     T, n = cfg.num_steps, cfg.buffer_size // cfg.num_steps
+    shape = nets.obs_space.shape
+    if nets.colors:
+        assert nets.colors <= 16 and shape[-2] % 2 == 0 and nets.obs_space.dtype == jnp.uint8
+        shape = (*shape[:-2], shape[-2] // 2, shape[-1])
     data = Rollout(
-        obs=jnp.zeros((T + 1, n, *nets.obs_space.shape), nets.obs_space.dtype),
+        obs=jnp.zeros((T + 1, n, *shape), nets.obs_space.dtype),
         action=jnp.zeros((T, n), jnp.int32),
         reward=jnp.zeros((T, n)),
         done=jnp.zeros((T, n), bool),
@@ -217,15 +223,26 @@ def act(nets: Nets, cfg: Config, env, params, envs: Envs, key: jax.Array) -> tup
     return rollout, jax.tree.map(jnp.sum, stats), envs
 
 
-def store(buffer: Buffer, rollout: Rollout) -> Buffer:
+def pack_obs(obs: jax.Array) -> jax.Array:
+    """Two ARC color indices per byte, adjacent pixels along the width."""
+    return obs[..., ::2, :] | (obs[..., 1::2, :] << 4)
+
+
+def unpack_obs(obs: jax.Array) -> jax.Array:
+    return jnp.stack((obs & 15, obs >> 4), axis=-2).reshape(*obs.shape[:-2], obs.shape[-2] * 2, obs.shape[-1])
+
+
+def store(nets: Nets, buffer: Buffer, rollout: Rollout) -> Buffer:
     """The rollout's trajectories overwrite the oldest ones."""
+    if nets.colors:
+        rollout = rollout._replace(obs=pack_obs(rollout.obs))
     capacity, n = buffer.data.action.shape[1], rollout.action.shape[1]
     i = (buffer.idx + jnp.arange(n)) % capacity
     data = jax.tree.map(lambda b, r: b.at[:, i].set(r), buffer.data, rollout)
     return Buffer(data, (buffer.idx + n) % capacity, jnp.minimum(capacity, buffer.size + n))
 
 
-def sample(cfg: Config, buffer: Buffer, key: jax.Array) -> tuple[Rollout, jax.Array]:
+def sample(nets: Nets, cfg: Config, buffer: Buffer, key: jax.Array) -> tuple[Rollout, jax.Array]:
     """A batch: a replay share from the whole buffer, the rest from the rollout stored last; and whether the buffer
     holds a batch at all."""
     key_old, key_new, key_mix = jax.random.split(key, 3)
@@ -233,7 +250,10 @@ def sample(cfg: Config, buffer: Buffer, key: jax.Array) -> tuple[Rollout, jax.Ar
     old = buffer.idx - 1 - jax.random.randint(key_old, (cfg.batch,), 0, buffer.size)
     new = buffer.idx - jax.random.randint(key_new, (cfg.batch,), 1, cfg.num_envs + 1)
     i = jnp.where(jax.random.bernoulli(key_mix, cfg.replay, (cfg.batch,)), old, new) % capacity
-    return jax.tree.map(lambda x: x[:, i], buffer.data), buffer.size >= cfg.batch
+    batch = jax.tree.map(lambda x: x[:, i], buffer.data)
+    if nets.colors:
+        batch = batch._replace(obs=unpack_obs(batch.obs))
+    return batch, buffer.size >= cfg.batch
 
 
 def rule_inputs(cfg: Config, out, traj: Rollout) -> tuple[RuleInputs, jax.Array]:
@@ -280,8 +300,8 @@ def agent_update(nets: Nets, cfg: Config, meta_graphdef, env, meta_params, carry
     agent, buffer, envs = carry
     key_act, key_sample = jax.random.split(key)
     rollout, stats, envs = act(nets, cfg, env, jax.lax.stop_gradient(agent.params), envs, key_act)
-    buffer = store(buffer, rollout)
-    batch, ready = sample(cfg, buffer, key_sample)
+    buffer = store(nets, buffer, rollout)
+    batch, ready = sample(nets, cfg, buffer, key_sample)
     params, opt_state, logits, reg, pi_hat_entropy, features = learn(
         nets, cfg, meta_graphdef, meta_params, agent.params, agent.opt_state, batch
     )
@@ -373,13 +393,16 @@ def train(cfg: Config, specs: dict[str, Spec] = SPECS):
     meta_opt_state = jax.vmap(lambda _: meta_tx.init(meta_params))(jnp.arange(num_agents))
     key = jax.random.key(cfg.seed)
 
+    device = jax.sharding.SingleDeviceSharding(jax.local_devices()[0])
+    host = device.with_memory_kind("pinned_host")
+
     def init_state():
         """Per game: its agents, their buffers and envs, each with a leading axis over the game's agents."""
         agents, buffers, envs = [], [], []
         for g, game in enumerate(games):
             key_agents, key_envs = jax.random.split(jax.random.fold_in(key, g))
             agents.append(jax.jit(jax.vmap(partial(init_agent, nets[g])))(jax.random.split(key_agents, per_game)))
-            buffers.append(jax.jit(jax.vmap(lambda _: init_buffer(nets[g], cfg)))(jnp.arange(per_game)))
+            buffers.append(jax.jit(jax.vmap(lambda _: init_buffer(nets[g], cfg)), out_shardings=host)(jnp.arange(per_game)))
             # under jit, so that leaves that are the same array (atari's obs and its state's frame stack) get buffers of their own for donation
             envs.append(jax.jit(jax.vmap(partial(init_envs, nets[g], game, cfg)))(jax.random.split(key_envs, per_game)))
         return agents, buffers, envs
@@ -398,12 +421,18 @@ def train(cfg: Config, specs: dict[str, Spec] = SPECS):
 
         # the game's agents together: their envs step in one kernel (collection is launch-bound), their convs are grouped
         def step(meta_params, agents, buffers, envs, key):
+            # One whole-buffer round trip per game meta-step; all inner updates sample on the GPU.
+            buffers = jax.device_put(buffers, device)
             grad, agents, buffers, envs, reset, metrics, stats = jax.vmap(one, in_axes=(None, 0, 0, 0, 0))(
                 meta_params, agents, buffers, envs, jax.random.split(key, per_game)
             )
-            return grad, agents, buffers, envs, reset, metrics, jax.tree.map(lambda s: s.sum(0), stats)
+            return grad, agents, jax.device_put(buffers, host), envs, reset, metrics, jax.tree.map(lambda s: s.sum(0), stats)
 
-        return jax.jit(step, donate_argnums=(1, 2, 3))
+        return jax.jit(
+            step, donate_argnums=(1, 2, 3),
+            in_shardings=(device, device, host, device, device),
+            out_shardings=(device, device, host, device, device, device, device),
+        )
 
     @jax.jit
     def meta_update(meta_params, meta_opt_state, grads):
@@ -424,7 +453,9 @@ def train(cfg: Config, specs: dict[str, Spec] = SPECS):
         steps = list(pool.map(lambda g: game_step(g).lower(meta_params, shapes[0][g], shapes[1][g], shapes[2][g], key).compile(), range(len(games))))
     m = [step.memory_analysis() for step in steps]
     print(
-        f"meta step memory: inputs {sum(x.argument_size_in_bytes for x in m) / 2**30:.2f} GB, temporary {max(x.temp_size_in_bytes for x in m) / 2**30:.2f} GB (largest game); per game: "
+        f"meta step memory: device inputs {sum(x.argument_size_in_bytes for x in m) / 2**30:.2f} GiB, "
+        f"host replay {sum(x.host_argument_size_in_bytes for x in m) / 2**30:.2f} GiB, "
+        f"temporary {max(x.temp_size_in_bytes for x in m) / 2**30:.2f} GiB (largest game); per game: "
         + " ".join(f"{name} {x.temp_size_in_bytes / 2**30:.1f}" for name, x in zip(cfg.games, m))
     )
     agents, buffers, envs = init_state()
