@@ -1,12 +1,13 @@
 """Self-checks for the agent network and the meta-network: python src/test_nn.py"""
 
 import jax
+import numpy as np
 from flax import nnx
 from jax import numpy as jnp
 
 from envs import make
 from envs.arc import NUM_COLORS
-from nn import MetaNetwork, Recurrent, RuleInputs, agent_heads, space_to_depth
+from nn import MetaNetwork, Recurrent, RuleInputs, agent_heads, projected_gru, space_to_depth
 
 PATCH = (((4, 32), (3, 64)), 512)  # patch layers and width, as disco.ATARI
 
@@ -37,6 +38,42 @@ def test_unroll_matches_steps():
         carry, out = net.step(carry, obs[t])
         outs.append(out)
     assert jnp.allclose(net.unroll(jnp.zeros((B, 16)), obs, done), jnp.stack(outs), atol=1e-6)
+
+
+def test_projected_gru_matches_flax():
+    """Preserve outputs, gradients and meta-gradients, including resets in both scan directions."""
+    for inputs, hidden, reverse in ((16, 16, False), (19, 8, True)):
+        graph, params = nnx.split(nnx.GRUCell(inputs, hidden, rngs=nnx.Rngs(0)))
+        x = jax.random.normal(jax.random.key(1), (5, 3, inputs))
+        h = jax.random.normal(jax.random.key(2), (3, hidden))
+        resets = jnp.zeros((5, 3), bool).at[2, 0].set(True).at[3, 2].set(True)
+
+        def unroll(args, projected):
+            params, x, h = args
+            cell = nnx.merge(graph, params)
+            if projected:
+                x = cell.dense_i(x)
+
+            def body(h, item):
+                xi, reset = item
+                h = jnp.where(reset[:, None], 0, h)
+                return projected_gru(cell, h, xi) if projected else cell(h, xi)
+
+            return jax.lax.scan(body, h, (x, resets), reverse=reverse)[1]
+
+        def loss(args, projected):
+            y = unroll(args, projected)
+            return jnp.sin(y).sum() + 0.01 * (y * y).sum()
+
+        args = (params, x, h)
+        direction = jax.tree.map(lambda a: jnp.full_like(a, 0.01), args)
+        outputs = []
+        for projected in (False, True):
+            grad = jax.grad(lambda a: loss(a, projected))
+            outputs.append((jax.jit(lambda a: unroll(a, projected))(args), jax.jit(grad)(args),
+                            jax.jit(lambda a: jax.jvp(grad, (a,), (direction,))[1])(args)))
+        for left, right in zip(jax.tree.leaves(outputs[0]), jax.tree.leaves(outputs[1])):
+            np.testing.assert_allclose(left, right, rtol=1e-4, atol=1e-5)
 
 
 def test_patch_layer_is_the_strided_conv():
@@ -111,6 +148,7 @@ def test_meta_ignores_padded_actions():
 if __name__ == "__main__":
     test_agent_heads()
     test_unroll_matches_steps()
+    test_projected_gru_matches_flax()
     test_patch_layer_is_the_strided_conv()
     test_color_frames()
     test_meta_looks_only_ahead_within_an_episode()

@@ -53,6 +53,16 @@ def space_to_depth(x: jax.Array, k: int) -> jax.Array:
     return jnp.moveaxis(x.reshape(*lead, h // k, k, w // k, k, c), -4, -3).reshape(*lead, h // k, w // k, k * k * c)
 
 
+def projected_gru(cell, carry, projected):
+    xi_r, xi_z, xi_n = jnp.split(projected, 3, axis=-1)
+    hh_r, hh_z, hh_n = jnp.split(cell.dense_h(carry), 3, axis=-1)
+    r = cell.gate_fn(xi_r + hh_r)
+    z = cell.gate_fn(xi_z + hh_z)
+    n = cell.activation_fn(xi_n + r * hh_n)
+    h = (1.0 - z) * n + z * carry
+    return h, h
+
+
 class Recurrent(nnx.Module):
     """Patch layers (per layer: pixel block, features; a linear over each block's pixels, i.e. a stride-block conv as a
     matmul), a dense layer, a GRU, a linear output. With colors, the frame is one channel of color indices, one-hot
@@ -89,12 +99,12 @@ class Recurrent(nnx.Module):
         first, where done (T, B) at t ends the episode, so the carry restarts from zeros at t + 1."""
         # one step's frames at a time, recomputed in the backward pass: the encoder's activations (a one-hot is 16x
         # the frame) of one step in memory, not of the whole batch
-        x = jax.lax.map(jax.checkpoint(self.encode), obs)
+        x = self.gru.dense_i(jax.lax.map(jax.checkpoint(self.encode), obs))
         reset = jnp.concatenate([jnp.zeros_like(done[:1]), done])
 
         def body(carry, step):
             x_t, reset_t = step
-            carry, _ = self.gru(jnp.where(reset_t[:, None], 0.0, carry), x_t)
+            carry, _ = projected_gru(self.gru, jnp.where(reset_t[:, None], 0.0, carry), x_t)
             return carry, carry
 
         _, carries = jax.lax.scan(body, carry, (x, reset))
@@ -219,11 +229,13 @@ class MetaNetwork(nnx.Module):
         )
         inputs = jnp.concatenate([per_step, action_emb.mean(-2, where=x.valid[:, None]), take(action_emb, x.action)], -1)
 
+        inputs = self.gru.dense_i(inputs)
+
         def body(h, step):
             x_t, ended = step
             # the carry comes from step t+1, which is another episode when t ended one
             h = jnp.where(ended[:, None], 0.0, h)
-            return self.gru(h, x_t)
+            return projected_gru(self.gru, h, x_t)
 
         # a plain scan: nnx.scan rejects the cell's params when they are gradient tracers of the meta-gradient
         _, h = jax.lax.scan(body, jnp.zeros((x.reward.shape[1], self.hidden_dim)), (inputs, x.discount == 0), reverse=True)
