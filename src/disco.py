@@ -89,7 +89,7 @@ class Nets(NamedTuple):
     hidden: int  # the GRU width: the agent's carry is (hidden,) per env
     lifetimes: jax.Array
     new_agent: Any  # new_agent(rngs=...) -> nn.Recurrent with the outputs of nn.agent_heads
-    new_critic: Any
+    new_critic: Any  # linear value readout on detached actor GRU features
     graphdef: Any
     critic_graphdef: Any
     agent_tx: optax.GradientTransformation
@@ -148,7 +148,7 @@ def make_nets(cfg: Config, env, spec: Spec, num_actions: int) -> Nets:
     new_agent = partial(
         Recurrent, num_actions + cfg.d + num_actions * cfg.d + num_actions, obs_space.shape, spec.convs, spec.hidden, colors=spec.colors
     )
-    new_critic = partial(Recurrent, 1, obs_space.shape, spec.convs, spec.hidden, colors=spec.colors)
+    new_critic = partial(nnx.Linear, spec.hidden, 1, kernel_init=nnx.initializers.normal(1e-2))
     graphdef, _ = nnx.split(new_agent(rngs=nnx.Rngs(0)))
     critic_graphdef, _ = nnx.split(new_critic(rngs=nnx.Rngs(0)))
     agent_tx = optax.chain(scale_by_adam_sg_denom(), optax.clip(cfg.max_abs_update), optax.scale(-spec.lr))
@@ -252,18 +252,18 @@ def rule_inputs(cfg: Config, out, traj: Rollout, valid: jax.Array) -> tuple[Rule
     return inputs, returns
 
 
-def critic_values(nets: Nets, critic, batch: Rollout) -> jax.Array:
-    """(T + 1, B) values of the batch's observations. The critic never acts, so it always unrolls from zeros: what it
-    is trained on is what it is used on."""
-    model = nnx.merge(nets.critic_graphdef, critic)
-    return model.unroll(jnp.zeros((batch.obs.shape[1], nets.hidden)), batch.obs, batch.done).squeeze(-1)
+def critic_values(nets: Nets, critic, features: jax.Array) -> jax.Array:
+    """A learned readout on already-computed, stopped actor features."""
+    return nnx.merge(nets.critic_graphdef, critic)(jax.lax.stop_gradient(features)).squeeze(-1)
 
 
 def learn(nets: Nets, cfg: Config, meta_graphdef, meta_params, params, opt_state, batch: Rollout, valid: jax.Array):
     """One agent update towards the meta-network's targets on a batch. Also returns the policy before it (constant) and
-    the meta-objective's regulariser on the targets."""
+    the meta-objective's regulariser on the targets, target entropy, and detached pre-update features for the critic."""
     # y and z carry the meta-gradient back to the params, through this pass
-    out = agent_heads(nnx.merge(nets.graphdef, params).unroll(batch.carry[0], batch.obs, batch.done), nets.num_actions, cfg.d, valid)
+    model = nnx.merge(nets.graphdef, params)
+    features = model.unroll_features(batch.carry[0], batch.obs, batch.done)
+    out = agent_heads(model.out(features), nets.num_actions, cfg.d, valid)
     inputs, returns = rule_inputs(cfg, out, batch, valid)
     pi_hat, y_hat, z_hat = nnx.merge(meta_graphdef, meta_params)(inputs)
     grads = nets.inner_grad(params, (pi_hat, y_hat, z_hat, returns), (batch, valid))
@@ -272,7 +272,7 @@ def learn(nets: Nets, cfg: Config, meta_graphdef, meta_params, params, opt_state
     logits = jax.lax.stop_gradient(out[0][:-1])
     pi_hat_mean = pi_hat.mean(where=jnp.broadcast_to(valid, pi_hat.shape))  # the illegal actions' logits are a constant
     reg = cfg.target_mean_coef * (pi_hat_mean**2 + y_hat.mean() ** 2 + z_hat.mean() ** 2) + cfg.pi_hat_kl_coef * kl(logits, pi_hat).mean()
-    return optax.apply_updates(params, updates), opt_state, logits, reg, entropy(pi_hat).mean()
+    return optax.apply_updates(params, updates), opt_state, logits, reg, entropy(pi_hat).mean(), jax.lax.stop_gradient(features)
 
 
 def agent_update(nets: Nets, cfg: Config, meta_graphdef, env, meta_params, carry: tuple[Agent, Buffer, Envs], key: jax.Array):
@@ -283,7 +283,7 @@ def agent_update(nets: Nets, cfg: Config, meta_graphdef, env, meta_params, carry
     rollout, stats, envs = act(nets, cfg, env, jax.lax.stop_gradient(agent.params), agent.valid, envs, key_act)
     buffer = store(buffer, rollout)
     batch, ready = sample(cfg, buffer, key_sample)
-    params, opt_state, logits, reg, pi_hat_entropy = jax.checkpoint(partial(learn, nets, cfg, meta_graphdef))(
+    params, opt_state, logits, reg, pi_hat_entropy, features = jax.checkpoint(partial(learn, nets, cfg, meta_graphdef))(
         meta_params, agent.params, agent.opt_state, batch, agent.valid
     )
 
@@ -291,19 +291,20 @@ def agent_update(nets: Nets, cfg: Config, meta_graphdef, env, meta_params, carry
     rho = take(jax.nn.softmax(logits), batch.action) / take(batch.mu, batch.action)
 
     def critic_loss_fn(critic_params):
-        values = critic_values(nets, critic_params, batch)
+        values = critic_values(nets, critic_params, features)
         targets, _ = vtrace(jax.lax.stop_gradient(values), batch.reward, cfg.gamma * ~batch.done, rho, cfg.lam)
         return 0.5 * ((targets - values[:-1]) ** 2).mean()
 
     critic = jax.lax.stop_gradient(agent.critic)
-    critic_updates, critic_opt_state = nets.critic_tx.update(jax.grad(critic_loss_fn)(critic), agent.critic_opt_state, critic)
+    critic_loss, critic_grad = jax.value_and_grad(critic_loss_fn)(critic)
+    critic_updates, critic_opt_state = nets.critic_tx.update(critic_grad, agent.critic_opt_state, critic)
 
     # learning starts once the buffer holds one batch, as in DiscoRL's evaluation
     new = (params, opt_state, optax.apply_updates(critic, critic_updates), critic_opt_state)
     old = (agent.params, agent.opt_state, agent.critic, agent.critic_opt_state)
     params, opt_state, critic, critic_opt_state = jax.tree.map(lambda n, o: jnp.where(ready, n, o), new, old)
     agent = agent._replace(params=params, opt_state=opt_state, critic=critic, critic_opt_state=critic_opt_state)
-    metrics = {"pi_hat_entropy": pi_hat_entropy, "rho": jnp.minimum(rho, 1.0).mean(), "ready": ready}
+    metrics = {"pi_hat_entropy": pi_hat_entropy, "rho": jnp.minimum(rho, 1.0).mean(), "ready": ready, "critic_loss": critic_loss}
     return (agent, buffer, envs), (ready * reg, metrics, stats)
 
 
@@ -323,9 +324,11 @@ def outer_loss(nets: Nets, cfg: Config, meta_graphdef, env, meta_params, agent: 
     stats = jax.tree.map(lambda s, v: s.sum(0) + v.sum(0), stats, valid_stats)
     # (rollouts, T, N, ...) -> (T, rollouts * N, ...)
     valid = jax.tree.map(lambda x: jnp.moveaxis(x, 0, 1).reshape(x.shape[1], -1, *x.shape[3:]), rollouts)
-    out = agent_heads(nnx.merge(nets.graphdef, agent.params).unroll(valid.carry[0], valid.obs, valid.done), nets.num_actions, cfg.d, agent.valid)
+    model = nnx.merge(nets.graphdef, agent.params)
+    features = model.unroll_features(valid.carry[0], valid.obs, valid.done)
+    out = agent_heads(model.out(features), nets.num_actions, cfg.d, agent.valid)
     logits, y, z, _ = jax.tree.map(lambda x: x[:-1], out)
-    values = critic_values(nets, agent.critic, valid)
+    values = critic_values(nets, agent.critic, features)
     rho = jax.lax.stop_gradient(take(jax.nn.softmax(logits), valid.action) / take(valid.mu, valid.action))
     _, advantage = vtrace(values, valid.reward, cfg.gamma * ~valid.done, rho, cfg.lam)
     # normalised per agent, so that games with large values don't dominate the meta-gradient

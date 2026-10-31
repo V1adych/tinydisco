@@ -95,7 +95,11 @@ class Recurrent(nnx.Module):
         return carry, self.out(carry)
 
     def unroll(self, carry: jax.Array, obs: jax.Array, done: jax.Array) -> jax.Array:
-        """The output (T + 1, B, num_outputs) over trajectories: obs (T + 1, B, ...) from the carry (B, hidden) at the
+        """(T + 1, B, num_outputs) predictions over trajectories, resetting the carry after episode ends."""
+        return self.out(self.unroll_features(carry, obs, done))
+
+    def unroll_features(self, carry: jax.Array, obs: jax.Array, done: jax.Array) -> jax.Array:
+        """GRU features (T + 1, B, hidden) over trajectories: obs (T + 1, B, ...) from the carry (B, hidden) at the
         first, where done (T, B) at t ends the episode, so the carry restarts from zeros at t + 1."""
         # one step's frames at a time, recomputed in the backward pass: the encoder's activations (a one-hot is 16x
         # the frame) of one step in memory, not of the whole batch
@@ -108,7 +112,7 @@ class Recurrent(nnx.Module):
             return carry, carry
 
         _, carries = jax.lax.scan(body, carry, (x, reset))
-        return self.out(carries)
+        return carries
 
 
 def agent_heads(out: jax.Array, num_actions: int, d: int, valid: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
