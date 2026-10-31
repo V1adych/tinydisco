@@ -101,9 +101,8 @@ class Recurrent(nnx.Module):
     def unroll_features(self, carry: jax.Array, obs: jax.Array, done: jax.Array) -> jax.Array:
         """GRU features (T + 1, B, hidden) over trajectories: obs (T + 1, B, ...) from the carry (B, hidden) at the
         first, where done (T, B) at t ends the episode, so the carry restarts from zeros at t + 1."""
-        # one step's frames at a time, recomputed in the backward pass: the encoder's activations (a one-hot is 16x
-        # the frame) of one step in memory, not of the whole batch
-        x = self.gru.dense_i(jax.lax.map(jax.checkpoint(self.encode), obs))
+        # Batch four timesteps for throughput, retaining encoder recomputation to limit activation memory.
+        x = self.gru.dense_i(jax.lax.map(jax.checkpoint(self.encode), obs, batch_size=4))
         reset = jnp.concatenate([jnp.zeros_like(done[:1]), done])
 
         def body(carry, step):
