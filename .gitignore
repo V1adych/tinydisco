@@ -10,3 +10,4 @@ artifacts/
 profiling/
 .claude/
 src/envs/arc/originals/
+experiments/

@@ -18,6 +18,7 @@ Holdout set, 8 (rules absent from training, built from familiar pieces):
   dl01 moves run one action late, action 5 drops the queue | ob01 three avatars, action 5 picks one | hn01 tower of Hanoi | mb01 crates slide toward you
 All games are deterministic; the frame is (64, 64) color indices; reward is +1 per level, done on win or loss."""
 
+from .games.base import NUM_COLORS as NUM_COLORS
 from .games.bd01.game import Bd01
 from .games.bp01.game import Bp01
 from .games.co01.game import Co01
