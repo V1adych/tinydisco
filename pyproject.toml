@@ -1,7 +1,7 @@
 [project]
 name = "meta-rl"
 version = "0.1.0"
-requires-python = "==3.12.*"  # the python of ubuntu 24.04, so uv needs no download on the instance
+requires-python = "==3.12.*" # the python of ubuntu 24.04, so uv needs no download on the instance
 dependencies = [
     "jax>=0.11.2",
     "jax[cuda12]>=0.11.2; sys_platform == 'linux'", # CUDA wheels exist only for linux
@@ -19,9 +19,7 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = [
-    "arcengine",
-]
+dev = ["arcengine"]
 
 [tool.uv.sources]
 arcengine = { git = "https://github.com/arcprize/ARCEngine" }
