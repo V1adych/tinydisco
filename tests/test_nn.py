@@ -1,4 +1,4 @@
-"""Self-checks for the agent network and the meta-network: python src/test_nn.py"""
+"""Self-checks for the agent network and the meta-network: python -m pytest tests/test_nn.py"""
 
 import jax
 import numpy as np

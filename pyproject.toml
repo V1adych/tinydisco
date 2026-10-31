@@ -25,3 +25,7 @@ dev = [
 
 [tool.uv.sources]
 arcengine = { git = "https://github.com/arcprize/ARCEngine" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

@@ -1,5 +1,5 @@
 """Checks the JAX ARC-AGI-3 games against the original Python games (envs/arc/originals/<id>.py, see envs/arc/download.py,
-run with the arcengine dev dependency), frame by frame: python src/test_arc.py
+run with the arcengine dev dependency), frame by frame: python -m pytest tests/test_arc.py
 Per game: the original's class name and a guided policy that reaches what random play never does (locks, level passes)."""
 
 import heapq
@@ -15,7 +15,7 @@ from jax import numpy as jnp
 
 from envs import make
 
-ORIGINALS = Path(__file__).parent / "envs/arc/originals"
+ORIGINALS = Path(__file__).resolve().parents[1] / "src/envs/arc/originals"
 ACTIONS = (GameAction.ACTION1, GameAction.ACTION2, GameAction.ACTION3, GameAction.ACTION4, GameAction.ACTION5)
 STEPS_PER_LEVEL = 3000
 

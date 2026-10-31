@@ -1,4 +1,4 @@
-"""Self-checks for disco.py: python src/test_disco.py"""
+"""Self-checks for disco.py: python -m pytest tests/test_disco.py"""
 
 import tempfile
 from dataclasses import replace
@@ -7,7 +7,7 @@ import jax
 from flax import nnx
 from jax import numpy as jnp
 
-from disco import Config, Spec, init_buffer, make_nets, sample, store, train
+from disco import Config, Spec, critic_values, init_buffer, make_nets, sample, store, train
 from envs import arc, make
 
 TINY = Config(
@@ -34,6 +34,22 @@ def test_buffer_wraps_and_samples_the_new_rollout():
     assert set(batch.reward[0].tolist()) == {0.0, 1.0, 2.0}, "the replay share must come from the whole buffer"
 
 
+def test_critic_learns_without_changing_actor_features():
+    nets = make_nets(TINY, make("Atari-breakout")[0], TINY_SPEC, 4)
+    _, critic = nnx.split(nets.new_critic(rngs=nnx.Rngs(0)))
+    assert sum(x.size for x in jax.tree.leaves(critic)) == TINY_SPEC.hidden + 1
+    features = jax.random.normal(jax.random.key(1), (TINY.num_steps + 1, TINY.num_envs, TINY_SPEC.hidden))
+    assert critic_values(nets, critic, features).shape == features.shape[:2]
+
+    def loss(critic, features):
+        return ((critic_values(nets, critic, features) - 1.0) ** 2).mean()
+
+    critic_grad, feature_grad = jax.grad(loss, argnums=(0, 1))(critic, features)
+    assert jnp.all(feature_grad == 0), "the value loss must not train the actor's representation"
+    assert all(jnp.isfinite(g).all() for g in jax.tree.leaves(critic_grad))
+    assert any(jnp.any(g != 0) for g in jax.tree.leaves(critic_grad)), "the critic head must receive gradients"
+
+
 def test_meta_steps_run():
     """Two games with different action counts and observation shapes, tiny sizes, two meta steps: the meta-network must
     change and stay finite."""
@@ -53,6 +69,7 @@ def test_resume_restores_meta_network():
 
 if __name__ == "__main__":
     test_buffer_wraps_and_samples_the_new_rollout()
+    test_critic_learns_without_changing_actor_features()
     test_meta_steps_run()
     test_resume_restores_meta_network()
     print("ok")

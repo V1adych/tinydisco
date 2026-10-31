@@ -1,4 +1,4 @@
-"""Self-checks for utils.py: python src/test_utils.py"""
+"""Self-checks for utils.py: python -m pytest tests/test_utils.py"""
 
 import jax
 import optax

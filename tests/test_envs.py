@@ -1,4 +1,4 @@
-"""Self-checks for the envs package: python src/test_envs.py"""
+"""Self-checks for the envs package: python -m pytest tests/test_envs.py"""
 
 import jax
 from jax import numpy as jnp
