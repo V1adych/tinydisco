@@ -10,9 +10,8 @@ from jax import numpy as jnp
 from jaxtari.modification import apply_native_downscaling
 from jaxtari.wrappers import AtariState, AtariWrapper
 
-# 8 of jaxtari's 🥇 games (statuses from jaxtari's games_covered.md): a shooter, a driver, a crosser, a platformer, two
-# mazes, a digger and a sub; not Fishing Derby (its port takes ~35 ms a step on a GPU, 10x the others)
-TRAIN = ("asterix", "asteroids", "mspacman", "beamrider", "frostbite", "gopher", "kangaroo", "seaquest")
+# Yars Revenge and Kaboom replace Beamrider and Seaquest for cheaper updates with accessible reward.
+TRAIN = ("asterix", "asteroids", "mspacman", "yarsrevenge", "frostbite", "gopher", "kangaroo", "kaboom")
 HOLDOUT = ("breakout", "pong", "boxing")
 SIZE, FRAME_SKIP = 84, 4
 
