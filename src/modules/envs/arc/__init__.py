@@ -53,6 +53,6 @@ from .games.wk01.game import Wk01
 from .games.zq01.game import Zq01
 
 OFFICIAL = ("ls20", "tr87", "wa30", "g50t")
-TRAIN = ("sk01", "bp01", "co01", "ms01", "sn01", "tr87", "ls20", "wa30")
+TRAIN = ("sk01", "bp01", "sv01", "rs01", "sn01", "tr87", "ls20")
 HOLDOUT = ("wk01", "bd01", "or01", "rv01", "dl01", "ob01", "hn01", "mb01")
 ARC_GAMES = {"bd01": Bd01, "bp01": Bp01, "co01": Co01, "dl01": Dl01, "fs01": Fs01, "g50t": G50t, "gr01": Gr01, "hn01": Hn01, "hs01": Hs01, "ic01": Ic01, "ls20": Ls20, "mb01": Mb01, "ms01": Ms01, "nw01": Nw01, "ob01": Ob01, "or01": Or01, "rs01": Rs01, "rv01": Rv01, "sk01": Sk01, "sn01": Sn01, "sv01": Sv01, "tp01": Tp01, "tr87": Tr87, "ul01": Ul01, "va01": Va01, "wa30": Wa30, "wk01": Wk01, "zq01": Zq01}
