@@ -30,16 +30,23 @@ class Spec(NamedTuple):
     colors: int = 0
 
 
-# patch embeddings as nanodisco's frame stem: 4x4 pixel patches, then 3x3 of those (84 -> 21 -> 7); lifetimes: DiscoRL's ratios at 1/20 scale
+# patch embeddings as nanodisco's frame stem: 4x4 pixel patches, then 3x3 of those (84 -> 21 -> 7); DiscoRL's lifetime budgets
 ATARI = Spec(((4, 32), (3, 64)), 256, lr=3e-4, lifetimes=(20_000_000, 50_000_000, 100_000_000, 200_000_000))
 # 64x64 color frames: 4x4 patches of colors, then 2x2 of those (64 -> 16 -> 8)
 ARC = Spec(((4, 32), (2, 64)), 256, lr=3e-4, lifetimes=ATARI.lifetimes, colors=arc.NUM_COLORS)
+# Classic's flat symbolic observations need only the dense encoder and GRU.
+CRAFTAX = Spec((), 256, lr=3e-4, lifetimes=ATARI.lifetimes)
 # LPG's grid worlds and delayed chains: no patch layers (the grids don't split into patches), a small network so they
 # cost little, and lifetimes short enough that agents are still learning (a chain episode is 5 to 50 steps)
 # shortcut: lifetimes are a guess, check when a fresh agent's score stops rising
 TOY = Spec((), 32, lr=3e-4, lifetimes=(5_000_000, 10_000_000, 20_000_000, 40_000_000))
 TOY_TRAIN = ("Grid-dense", "Grid-long_horizon", "Grid-small_sparse", "Chain-long_noisy", "Chain-distraction")
-SPECS = {f"Atari-{game}": ATARI for game in atari.TRAIN} | {f"Arc-{game}": ARC for game in arc.TRAIN} | dict.fromkeys(TOY_TRAIN, TOY)
+SPECS = (
+    {f"Atari-{game}": ATARI for game in atari.TRAIN}
+    | {f"Arc-{game}": ARC for game in arc.TRAIN}
+    | dict.fromkeys(TOY_TRAIN, TOY)
+    | {"Craftax-Classic-Symbolic-v1": CRAFTAX}
+)
 
 
 @dataclass(frozen=True)
@@ -266,9 +273,7 @@ def rule_inputs(cfg: Config, out, traj: Rollout) -> tuple[RuleInputs, jax.Array]
     alive = (~traj.done).astype(jnp.float32)
     rho = take(pi[:-1], traj.action) / take(traj.mu, traj.action)
     returns = retrace(take(q[:-1], traj.action), v, traj.reward, cfg.gamma * alive, cfg.lam * jnp.minimum(rho, 1.0))
-    inputs = RuleInputs(
-        traj.action, traj.reward, alive, pi, traj.mu, jax.nn.softmax(y), jax.nn.softmax(z), q[:-1], v[:-1], v[1:], returns - v[:-1]
-    )
+    inputs = RuleInputs(traj.action, traj.reward, alive, pi, traj.mu, jax.nn.softmax(y), jax.nn.softmax(z), q[:-1], v[:-1], v[1:], returns - v[:-1])
     return inputs, returns
 
 
@@ -303,9 +308,7 @@ def agent_update(nets: Nets, cfg: Config, meta_graphdef, env, meta_params, carry
     rollout, stats, envs = act(nets, cfg, env, jax.lax.stop_gradient(agent.params), envs, key_act)
     buffer = store(nets, buffer, rollout)
     batch, ready = sample(nets, cfg, buffer, key_sample)
-    params, opt_state, logits, reg, pi_hat_entropy, features = learn(
-        nets, cfg, meta_graphdef, meta_params, agent.params, agent.opt_state, batch
-    )
+    params, opt_state, logits, reg, pi_hat_entropy, features = learn(nets, cfg, meta_graphdef, meta_params, agent.params, agent.opt_state, batch)
 
     # the critic learns the values of the policy before the update, by V-trace; it never carries the meta-gradient
     rho = take(jax.nn.softmax(logits), batch.action) / take(batch.mu, batch.action)
@@ -430,7 +433,8 @@ def train(cfg: Config, specs: dict[str, Spec] = SPECS):
             return grad, agents, jax.device_put(buffers, host), envs, reset, metrics, jax.tree.map(lambda s: s.sum(0), stats)
 
         return jax.jit(
-            step, donate_argnums=(1, 2, 3),
+            step,
+            donate_argnums=(1, 2, 3),
             in_shardings=(device, device, host, device, device),
             out_shardings=(device, device, host, device, device, device, device),
         )
