@@ -214,6 +214,7 @@ def act(nets: Nets, cfg: Config, env, params, envs: Envs, key: jax.Array) -> tup
             jax.random.split(key_step, cfg.num_envs), envs.state, action, None
         )
         stats = {"episodes": done.sum(), "score": (info["score"] * done).sum()}  # an env's score counts on the step its episode ends
+        stats |= {k.lower(): (v * done).sum() for k, v in info.items() if k.lower().startswith("achievements/")}
         carry = jnp.where(done[:, None], 0.0, carry)  # the next obs starts an episode
         return Envs(state, next_obs, carry), ((envs.obs, action, reward, done, jax.nn.softmax(logits)), stats)
 
