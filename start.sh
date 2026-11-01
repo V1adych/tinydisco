@@ -45,5 +45,5 @@ export PYTHONUNBUFFERED=1
 export JAX_LOG_COMPILES=1
 export JAX_COMPILATION_CACHE_DIR=~/jax_cache
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
-# e.g. python launch.py python src/disco.py --track
+# e.g. python launch.py python src/scripts/disco.py --track
 uv run $RUN_COMMAND

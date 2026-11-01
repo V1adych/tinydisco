@@ -5,9 +5,9 @@ import numpy as np
 from flax import nnx
 from jax import numpy as jnp
 
-from envs import make
-from envs.arc import NUM_COLORS
-from nn import MetaNetwork, Recurrent, RuleInputs, agent_heads, projected_gru, space_to_depth
+from modules.envs import make
+from modules.envs.arc import NUM_COLORS
+from modules.nn import MetaNetwork, Recurrent, RuleInputs, agent_heads, projected_gru, space_to_depth
 
 PATCH = (((4, 32), (3, 64)), 512)  # patch layers and width, as disco.ATARI
 

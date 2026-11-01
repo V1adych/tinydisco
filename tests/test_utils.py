@@ -4,7 +4,7 @@ import jax
 import optax
 from jax import numpy as jnp
 
-from utils import mixflow_grad, retrace, vtrace
+from modules.utils import mixflow_grad, retrace, vtrace
 
 # a 3-step rollout, gamma 0.5, whose episode ends at step 1; on-policy with full traces both estimators are Monte Carlo
 REWARD = jnp.array([[1.0], [2.0], [3.0]])

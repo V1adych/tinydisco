@@ -8,8 +8,8 @@ import jax
 from flax import nnx
 from jax import numpy as jnp
 
-from disco import Config, Spec, critic_values, init_buffer, make_nets, pack_obs, sample, store, train, unpack_obs
-from envs import arc, make
+from scripts.disco import Config, Spec, critic_values, init_buffer, make_nets, pack_obs, sample, store, train, unpack_obs
+from modules.envs import arc, make
 
 TINY = Config(
     games=("Atari-breakout", "Arc-sv01"), agents_per_game=2, num_envs=2, num_steps=3, num_updates=3, batch=4, buffer_size=30, valid_rollouts=1,

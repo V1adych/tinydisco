@@ -9,5 +9,7 @@ try_wandb.py
 artifacts/
 profiling/
 .claude/
-src/envs/arc/originals/
+src/modules/envs/arc/originals/
 experiments/
+build/
+*.egg-info/

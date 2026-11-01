@@ -3,9 +3,9 @@
 import jax
 from jax import numpy as jnp
 
-from envs import make
-from envs.chain import CHAINS
-from envs.grid import GRIDS, GridState
+from modules.envs import make
+from modules.envs.chain import CHAINS
+from modules.envs.grid import GRIDS, GridState
 
 
 def test_chain_pays_for_the_first_action():

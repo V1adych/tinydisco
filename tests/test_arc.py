@@ -1,4 +1,4 @@
-"""Checks the JAX ARC-AGI-3 games against the original Python games (envs/arc/originals/<id>.py, see envs/arc/download.py,
+"""Checks the JAX ARC-AGI-3 games against the original Python games (envs/arc/originals/<id>.py, see src/modules/envs/arc/download.py,
 run with the arcengine dev dependency), frame by frame: python -m pytest tests/test_arc.py
 Per game: the original's class name and a guided policy that reaches what random play never does (locks, level passes)."""
 
@@ -13,16 +13,16 @@ import numpy as np
 from arcengine import ActionInput, GameAction, GameState
 from jax import numpy as jnp
 
-from envs import make
+from modules.envs import make
 
-ORIGINALS = Path(__file__).resolve().parents[1] / "src/envs/arc/originals"
+ORIGINALS = Path(__file__).resolve().parents[1] / "src/modules/envs/arc/originals"
 ACTIONS = (GameAction.ACTION1, GameAction.ACTION2, GameAction.ACTION3, GameAction.ACTION4, GameAction.ACTION5)
 STEPS_PER_LEVEL = 3000
 
 
 def load_original(name: str, class_name: str):
     path = ORIGINALS / f"{name}.py"
-    assert path.exists(), f"{path} is missing: python src/envs/arc/download.py fetches the originals"
+    assert path.exists(), f"{path} is missing: python src/modules/envs/arc/download.py fetches the originals"
     spec = importlib.util.spec_from_file_location(f"{name}_original", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[f"{name}_original"] = module

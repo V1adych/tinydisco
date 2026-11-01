@@ -1,5 +1,5 @@
 """Rents a GPU that runs the given command in the repo and deletes itself when it exits, e.g.
-    python launch.py python src/disco.py --track
+    python launch.py python src/scripts/disco.py --track
 PROVIDER=vast (default) rents the cheapest acceptable Vast.ai offer; PROVIDER=runpod a RunPod pod (CLOUD=SECURE when community is out of stock).
 GPU names the card in the provider's own naming, e.g. GPU="RTX 5090" or GPU="NVIDIA GeForce RTX 5090".
 Needs WANDB_API_KEY, GITHUB_DEPLOY_KEY (base64) and the provider's VASTAI_API_KEY or RUNPOD_API_KEY in the environment."""

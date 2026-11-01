@@ -828,7 +828,7 @@ wheels = [
 [[package]]
 name = "meta-rl"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "craftax" },
     { name = "flax" },
