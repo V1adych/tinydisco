@@ -31,13 +31,13 @@ class Spec(NamedTuple):
 
 
 # patch embeddings as nanodisco's frame stem: 4x4 pixel patches, then 3x3 of those (84 -> 21 -> 7); lifetimes: DiscoRL's ratios at 1/20 scale
-ATARI = Spec(((4, 32), (3, 64)), 256, lr=3e-4, lifetimes=(5_000_000, 12_500_000, 10_000_000, 20_000_000))
+ATARI = Spec(((4, 32), (3, 64)), 256, lr=3e-4, lifetimes=(20_000_000, 50_000_000, 100_000_000, 200_000_000))
 # 64x64 color frames: 4x4 patches of colors, then 2x2 of those (64 -> 16 -> 8)
 ARC = Spec(((4, 32), (2, 64)), 256, lr=3e-4, lifetimes=ATARI.lifetimes, colors=arc.NUM_COLORS)
 # LPG's grid worlds and delayed chains: no patch layers (the grids don't split into patches), a small network so they
 # cost little, and lifetimes short enough that agents are still learning (a chain episode is 5 to 50 steps)
 # shortcut: lifetimes are a guess, check when a fresh agent's score stops rising
-TOY = Spec((), 32, lr=3e-4, lifetimes=(1_000_000, 2_500_000, 5_000_000, 10_000_000))
+TOY = Spec((), 32, lr=3e-4, lifetimes=(5_000_000, 10_000_000, 20_000_000, 40_000_000))
 TOY_TRAIN = ("Grid-dense", "Grid-long_horizon", "Grid-small_sparse", "Chain-long_noisy", "Chain-distraction")
 SPECS = {f"Atari-{game}": ATARI for game in atari.TRAIN} | {f"Arc-{game}": ARC for game in arc.TRAIN} | dict.fromkeys(TOY_TRAIN, TOY)
 
@@ -45,15 +45,15 @@ SPECS = {f"Atari-{game}": ATARI for game in atari.TRAIN} | {f"Arc-{game}": ARC f
 @dataclass(frozen=True)
 class Config:
     games: tuple[str, ...] = tuple(SPECS)  # envs.make names, each with a Spec in SPECS
-    agents_per_game: int = 8
-    num_envs: int = 8  # per agent
+    agents_per_game: int = 2
+    num_envs: int = 32  # per agent
     num_steps: int = 29  # T of a rollout
     num_updates: int = 10  # agent updates per meta step, all backpropagated through
-    batch: int = 96  # trajectories per agent update
+    batch: int = 256  # trajectories per agent update
     replay: float = 0.9  # share of the batch from the replay buffer, the rest from the new rollout
-    buffer_size: int = 32_768  # transitions per agent, rounded down to whole trajectories
-    valid_rollouts: int = 6  # rollouts that score the updated agent: 6 x 8 = 48 trajectories, as DiscoRL
-    meta_steps: int = 5000
+    buffer_size: int = 131_072  # transitions per agent, rounded down to whole trajectories
+    valid_rollouts: int = 2  # rollouts that score the updated agent: 6 x 8 = 48 trajectories, as DiscoRL
+    meta_steps: int = 10000
     seed: int = 0
     gamma: float = 0.997  # DiscoRL's on Atari
     lam: float = 0.95  # trace decay of Retrace and V-trace
@@ -73,7 +73,7 @@ class Config:
     pi_hat_kl_coef: float = 1e-2  # KL(pi || pi_hat): keeps the policy targets near the current policy
     # logging
     log_interval: int = 10  # in meta steps
-    save_interval: int = 200  # in meta steps, 0 disables checkpoints
+    save_interval: int = 500  # in meta steps, 0 disables checkpoints
     checkpoint_dir: str = "checkpoints"
     resume: str | None = None  # continue from a checkpoint directory or wandb artifact at its step; optimizer state and agents start fresh
     track: bool = False
