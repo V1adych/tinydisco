@@ -29,7 +29,7 @@ class Config:
     meta_rule: str  # checkpoint directory or wandb artifact of a disco.py meta-network
     env_name: str = "Craftax-Classic-Pixels-v1"
     seed: int = 0
-    total_timesteps: int = 10_000_000
+    total_timesteps: int = 20_000_000
     num_envs: int = 32  # one agent, with this many parallel environments
     num_steps: int = 29
     batch: int = 256  # replay trajectories per update
