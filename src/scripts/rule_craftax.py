@@ -30,11 +30,11 @@ class Config:
     env_name: str = "Craftax-Classic-Pixels-v1"
     seed: int = 0
     total_timesteps: int = 10_000_000
-    num_envs: int = 8  # one agent, with this many parallel environments
+    num_envs: int = 32  # one agent, with this many parallel environments
     num_steps: int = 29
-    batch: int = 96  # replay trajectories per update
+    batch: int = 256  # replay trajectories per update
     replay: float = 0.9
-    buffer_size: int = 32_768  # transitions, rounded down to whole trajectories
+    buffer_size: int = 131_072  # transitions, rounded down to whole trajectories
     convs: tuple[tuple[int, int], ...] = ((7, 32),)  # Classic's 63x63 pixels -> 9x9 patches
     hidden: int = 256
     d: int = 64
