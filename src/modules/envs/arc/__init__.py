@@ -24,7 +24,7 @@ _METADATA = json.loads((ROOT / "training/arcjax/game_meta.json").read_text())["g
 ARC_GAMES = {name: meta for name, meta in _METADATA.items() if not meta["has_click"] and 6 not in meta["actions"]}
 PROCEDURAL = tuple(name for name, meta in ARC_GAMES.items() if meta.get("procedural"))
 OFFICIAL = tuple(name for name in ARC_GAMES if name not in PROCEDURAL)
-TRAIN = ("wk01", "dr02", "g014", "g001")
+TRAIN = ("wk01", "dr02", "g014", "g001", "g003", "g006", "g016", "g021", "g022", "g025", "g038", "g051")
 HOLDOUT = tuple(name for name in PROCEDURAL if name not in TRAIN)
 _LIB = None
 
