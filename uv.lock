@@ -73,15 +73,6 @@ wheels = [
 ]
 
 [[package]]
-name = "arcengine"
-version = "0.9.3"
-source = { git = "https://github.com/arcprize/ARCEngine#b495c6acaf253c9681cd7b75c4299d352e9ce6f8" }
-dependencies = [
-    { name = "numpy" },
-    { name = "pydantic" },
-]
-
-[[package]]
 name = "asttokens"
 version = "3.0.2"
 source = { registry = "https://pypi.org/simple" }
@@ -845,11 +836,6 @@ dependencies = [
     { name = "wandb" },
 ]
 
-[package.dev-dependencies]
-dev = [
-    { name = "arcengine" },
-]
-
 [package.metadata]
 requires-dist = [
     { name = "craftax", specifier = ">=1.6.1" },
@@ -866,9 +852,6 @@ requires-dist = [
     { name = "tyro", specifier = ">=1.0.16" },
     { name = "wandb", specifier = ">=0.30.0" },
 ]
-
-[package.metadata.requires-dev]
-dev = [{ name = "arcengine", git = "https://github.com/arcprize/ARCEngine" }]
 
 [[package]]
 name = "ml-dtypes"

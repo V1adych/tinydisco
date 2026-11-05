@@ -29,6 +29,21 @@ chmod 600 ~/.ssh/id_ed25519
 ssh-keyscan github.com >> ~/.ssh/known_hosts 2> /dev/null
 git clone git@github.com:V1adych/meta-rl.git /root/meta-rl
 cd /root/meta-rl
+if [ -n "$ARCGPU_DEPLOY_KEY" ]; then
+    echo "$ARCGPU_DEPLOY_KEY" | base64 -d > ~/.ssh/arcgpu
+    chmod 600 ~/.ssh/arcgpu
+    cat >> ~/.ssh/config <<'SSH'
+Host github-arcgpu
+    HostName github.com
+    User git
+    IdentityFile ~/.ssh/arcgpu
+    IdentitiesOnly yes
+SSH
+    git config submodule.arcgpu.url git@github-arcgpu:V1adych/arcgpu.git
+else
+    git config submodule.arcgpu.url git@github.com:V1adych/arcgpu.git
+fi
+git submodule update --init src/modules/envs/arc/arcgpu || exit 1
 uv sync --frozen
 # jaxtari's sprite pack; the owner confirmed owning the Atari 2600 ROMs
 JAXTARI_CONFIRM_OWNERSHIP=1 uv run install-sprites

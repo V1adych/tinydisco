@@ -1,0 +1,3 @@
+[submodule "arcgpu"]
+	path = src/modules/envs/arc/arcgpu
+	url = https://github.com/V1adych/arcgpu.git

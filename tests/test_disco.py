@@ -5,6 +5,7 @@ from dataclasses import replace
 from functools import partial
 
 import jax
+import pytest
 from flax import nnx
 from jax import numpy as jnp
 
@@ -12,11 +13,11 @@ from scripts.disco import Config, Spec, critic_values, init_buffer, make_nets, p
 from modules.envs import arc, make
 
 TINY = Config(
-    games=("Atari-breakout", "Arc-sv01"), agents_per_game=2, num_envs=2, num_steps=3, num_updates=3, batch=4, buffer_size=30, valid_rollouts=1,
+    games=("Atari-breakout", "Arc-wk01"), agents_per_game=2, num_envs=2, num_steps=3, num_updates=3, batch=4, buffer_size=30, valid_rollouts=1,
     d=4, meta_hidden=8, meta_steps=2, log_interval=1, save_interval=0,
 )
 TINY_SPEC = Spec(((4, 8),), 16, lr=3e-4, lifetimes=(100, 1000))
-TINY_SPECS = {"Atari-breakout": TINY_SPEC, "Arc-sv01": TINY_SPEC._replace(colors=arc.NUM_COLORS)}
+TINY_SPECS = {"Atari-breakout": TINY_SPEC, "Arc-wk01": TINY_SPEC._replace(colors=arc.NUM_COLORS)}
 
 
 def test_buffer_wraps_and_samples_the_new_rollout():
@@ -40,7 +41,7 @@ def test_buffer_wraps_and_samples_the_new_rollout():
 
 def test_packed_replay_matches_unpacked_after_wrap_and_reset():
     cfg = replace(TINY, buffer_size=5 * TINY.num_steps)
-    nets = make_nets(cfg, make("Arc-sv01")[0], TINY_SPECS["Arc-sv01"])
+    nets = make_nets(cfg, make("Arc-wk01")[0], TINY_SPECS["Arc-wk01"])
     raw_nets = nets._replace(colors=0)
     packed, raw = init_buffer(nets, cfg), init_buffer(raw_nets, cfg)
     assert packed.data.obs.nbytes * 2 == raw.data.obs.nbytes
@@ -80,6 +81,7 @@ def test_critic_learns_without_changing_actor_features():
     assert any(jnp.any(g != 0) for g in jax.tree.leaves(critic_grad)), "the critic head must receive gradients"
 
 
+@pytest.mark.skipif(jax.local_devices()[0].platform != "gpu", reason="arcgpu requires CUDA")
 def test_meta_steps_run():
     """Two games with different action counts and observation shapes, tiny sizes, two meta steps: the meta-network must
     change and stay finite."""

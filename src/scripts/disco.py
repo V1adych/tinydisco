@@ -43,7 +43,7 @@ TOY = Spec((), 32, lr=3e-4, lifetimes=(5_000_000, 10_000_000, 20_000_000, 40_000
 TOY_TRAIN = ("Grid-dense", "Grid-long_horizon", "Grid-small_sparse", "Chain-long_noisy", "Chain-distraction")
 SPECS = (
     {f"Atari-{game}": ATARI for game in atari.TRAIN}
-    | {f"Arc-{game}": ARC for game in arc.TRAIN}
+    | {f"Arc-{game}": ARC for game in arc.ARC_GAMES}
     | dict.fromkeys(TOY_TRAIN, TOY)
     | {"Craftax-Classic-Symbolic-v1": CRAFTAX}
 )
@@ -51,7 +51,7 @@ SPECS = (
 
 @dataclass(frozen=True)
 class Config:
-    games: tuple[str, ...] = tuple(SPECS)  # envs.make names, each with a Spec in SPECS
+    games: tuple[str, ...] = tuple(name for name in SPECS if not name.startswith("Arc-") or name[4:] in arc.TRAIN)  # envs.make names, each with a Spec in SPECS
     agents_per_game: int = 2
     num_envs: int = 32  # per agent
     num_steps: int = 29  # T of a rollout
@@ -377,14 +377,23 @@ def end_of_lifetime(nets: Nets, cfg: Config, env, agent: Agent, buffer: Buffer, 
     fresh = init_agent(nets, key_agent)._replace(age=jnp.int32(0))
     agent = jax.tree.map(lambda f, a: jnp.where(reset, f, a), fresh, agent._replace(age=age))
     buffer = buffer._replace(idx=jnp.where(reset, 0, buffer.idx), size=jnp.where(reset, 0, buffer.size))
-    envs = jax.tree.map(lambda f, e: jnp.where(reset, f, e), init_envs(nets, env, cfg, key_envs), envs)
+    if isinstance(env, arc.Arc):
+        obs, state = jax.vmap(env.reset_where)(envs.state, jnp.full((cfg.num_envs,), reset))
+        envs = Envs(state, obs, jnp.where(reset, 0.0, envs.carry))
+    else:
+        envs = jax.tree.map(lambda f, e: jnp.where(reset, f, e), init_envs(nets, env, cfg, key_envs), envs)
     return agent, buffer, envs, reset
 
 
 def train(cfg: Config, specs: dict[str, Spec] = SPECS):
     run_name = cfg.run_name or f"disco_s{cfg.seed}_{time.strftime('%Y%m%d-%H%M%S')}"
     logger = Logger(cfg, cfg.wandb_project, run_name, cfg.track)  # first, so that wandb records the console of a crash during setup
+    if len(set(cfg.games)) != len(cfg.games):
+        raise ValueError("games must be unique: each ARC game owns one simulator batch")
     games = [make(game)[0] for game in cfg.games]
+    for g, game in enumerate(games):
+        if isinstance(game, arc.Arc):
+            game.prepare(cfg.num_envs, cfg.agents_per_game, cfg.seed + g)
     nets = [make_nets(cfg, game, specs[name]) for name, game in zip(cfg.games, games)]
     num_agents, per_game = len(games) * cfg.agents_per_game, cfg.agents_per_game
     meta_network, start = MetaNetwork(cfg.d, cfg.meta_hidden, nnx.Rngs(cfg.seed)), 0

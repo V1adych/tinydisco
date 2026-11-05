@@ -6,8 +6,8 @@
 
 Names: 'Chain-<variant>' (envs.chain.CHAINS), 'Grid-<variant>' or 'Grid-<variant>-collect' for the 18-action set (envs.grid.GRIDS),
 Craftax names such as 'Craftax-Classic-Pixels-v1', 'Atari-<game>' with a jaxtari game (envs.atari.TRAIN, HOLDOUT),
-'Arc-<game>' with an ARC-AGI-3 game ported in envs.arc (envs.arc.ARC_GAMES; the sets OFFICIAL, TRAIN, HOLDOUT and what each
-game is are described there), and gymnax names such as 'Asterix-MinAtar'.
+'Arc-<game>' with a no-click arcgpu game (call env.prepare(num_envs, agents, seed) before compiling),
+and gymnax names such as 'Asterix-MinAtar'. ARC uses stateful CUDA calls; other environments are pure JAX.
 env.num_actions, env.observation_space(params) and env.action_space(params) work for all of them.
 Observations are uint8 (0-255 for [0, 1]); the models scale them back.
 """
@@ -17,7 +17,7 @@ from craftax.craftax_env import make_craftax_env_from_name
 from gymnax.environments import spaces
 from jax import numpy as jnp
 
-from .arc import ARC_GAMES
+from .arc import Arc
 from .atari import Atari
 from .chain import CHAINS, DelayedChain
 from .grid import GRIDS, GridWorld
@@ -75,7 +75,7 @@ def make(name: str):
     elif kind == "Atari":
         return Atari(variant), None  # already uint8
     elif kind == "Arc":
-        return ARC_GAMES[variant](), None  # already uint8
+        return Arc(variant), None  # already uint8
     elif kind == "Craftax":
         env = make_craftax_env_from_name(name, auto_reset=True)
     else:

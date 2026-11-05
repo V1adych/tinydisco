@@ -18,12 +18,6 @@ dependencies = [
     "jaxtari>=0.2.0",
 ]
 
-[dependency-groups]
-dev = ["arcengine"]
-
-[tool.uv.sources]
-arcengine = { git = "https://github.com/arcprize/ARCEngine" }
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
@@ -33,7 +27,4 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-exclude = ["modules.envs.arc.originals*"]
-
-[tool.setuptools.package-data]
-"modules.envs.arc" = ["games/*/*.npz"]
+exclude = ["modules.envs.arc.arcgpu*"]

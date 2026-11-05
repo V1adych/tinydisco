@@ -85,8 +85,7 @@ def test_patch_layer_is_the_strided_conv():
 
 
 def test_color_frames():
-    env, _ = make("Arc-ls20")
-    obs, _ = jax.vmap(env.reset)(jax.random.split(jax.random.key(0), 6))
+    obs = jax.random.randint(jax.random.key(0), (6, 64, 64, 1), 0, NUM_COLORS, dtype=jnp.uint8)
     net = Recurrent(7, obs.shape[1:], ((4, 32), (2, 64)), 512, nnx.Rngs(0), colors=NUM_COLORS)
     _, out = net.step(jnp.zeros((6, 512)), obs)
     assert out.shape == (6, 7) and out.dtype == jnp.float32

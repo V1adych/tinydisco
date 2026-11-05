@@ -1,58 +1,119 @@
-"""ARC-AGI-3 games in JAX: games/base.py is the shared env class, games/<id>/ a game's logic, extractor and data;
-originals/ (gitignored, filled by download.py) holds the Python originals the extractors and test_arc.py read.
+"""No-click arcgpu games. CUDA state lives in the simulator, not in the JAX pytree.
 
-Official games (ARC Prize Foundation, the 4 keyboard-only ones of the 25 public games; the rest need the click action):
-  ls20  maze; carry a symbol whose shape/color/rotation tiles change, open locks that want the exact symbol; energy, lives, fog (7 levels)
-  tr87  rewriting puzzle; edit an answer row with a cursor until it is the source row rewritten by the rules shown (6 levels)
-  wa30  warehouse; grab/drag crates into goal zones while collector bots help and thief bots steal, step budget (9 levels, 5 actions)
-  g50t  maze with plates, doors, teleporters, patrols; action 5 rewinds your run into a ghost that replays it beside you (7 levels)
-Training combines ls20, tr87 and wa30 with five community games below; g50t is excluded for its high update cost.
-Community games (github.com/theredbluepill/arc-interactive, MIT): one mechanic each on a small grid scaled to the frame, 5 levels
-(gr01 6). Current training, 5:
-  sk01 sokoban | bp01 power towers with action 5, then exit | co01 pads recolor you, matching doors open
-  ms01 hidden minefield with counts | sn01 snake
-Former training, 6 (near-ceiling scores; available for retention checks, not unseen holdouts):
-  ul01 key opens door | fs01 step on all plates, then exit | tp01 paired teleporters | ic01 slide until blocked
-  gr01 gravity after each move | zq01 hazards blink on a period
-Spare, 5 (ported, in neither set):
-  va01 visit every cell | rs01 collect only the signposted color | nw01 arrow tiles force the next move
-  hs01 chased by a hunter (it never catches) | sv01 hunger and warmth meters, survive 60 steps
-Holdout set, 8 (rules absent from training, built from familiar pieces):
-  wk01 floor collapses behind you | bd01 entering a cell twice loses | or01 keys orbit a pillar | rv01 collect while sparks drift (harmless)
-  dl01 moves run one action late, action 5 drops the queue | ob01 three avatars, action 5 picks one | hn01 tower of Hanoi | mb01 crates slide toward you
-All games are deterministic; the frame is (64, 64) color indices; reward is +1 per level, done on win or loss."""
+Call prepare() before compiling resets/steps, with the total batch layout. Each
+vmap adds to that batch; never rematerialize an environment call or branch/fork
+its state. Hard resets draw fresh curricula from the engine's seeded generator.
+"""
 
-from .games.base import NUM_COLORS as NUM_COLORS
-from .games.bd01.game import Bd01
-from .games.bp01.game import Bp01
-from .games.co01.game import Co01
-from .games.dl01.game import Dl01
-from .games.fs01.game import Fs01
-from .games.g50t.game import G50t
-from .games.gr01.game import Gr01
-from .games.hn01.game import Hn01
-from .games.hs01.game import Hs01
-from .games.ic01.game import Ic01
-from .games.ls20.game import Ls20
-from .games.mb01.game import Mb01
-from .games.ms01.game import Ms01
-from .games.nw01.game import Nw01
-from .games.ob01.game import Ob01
-from .games.or01.game import Or01
-from .games.rs01.game import Rs01
-from .games.rv01.game import Rv01
-from .games.sk01.game import Sk01
-from .games.sn01.game import Sn01
-from .games.sv01.game import Sv01
-from .games.tp01.game import Tp01
-from .games.tr87.game import Tr87
-from .games.ul01.game import Ul01
-from .games.va01.game import Va01
-from .games.wa30.game import Wa30
-from .games.wk01.game import Wk01
-from .games.zq01.game import Zq01
+import ctypes
+import json
+import math
+import subprocess
+from pathlib import Path
+from typing import NamedTuple
 
-OFFICIAL = ("ls20", "tr87", "wa30", "g50t")
-TRAIN = ("sk01", "bp01", "sv01", "rs01", "sn01", "tr87", "ls20")
-HOLDOUT = ("wk01", "bd01", "or01", "rv01", "dl01", "ob01", "hn01", "mb01")
-ARC_GAMES = {"bd01": Bd01, "bp01": Bp01, "co01": Co01, "dl01": Dl01, "fs01": Fs01, "g50t": G50t, "gr01": Gr01, "hn01": Hn01, "hs01": Hs01, "ic01": Ic01, "ls20": Ls20, "mb01": Mb01, "ms01": Ms01, "nw01": Nw01, "ob01": Ob01, "or01": Or01, "rs01": Rs01, "rv01": Rv01, "sk01": Sk01, "sn01": Sn01, "sv01": Sv01, "tp01": Tp01, "tr87": Tr87, "ul01": Ul01, "va01": Va01, "wa30": Wa30, "wk01": Wk01, "zq01": Zq01}
+import jax
+from gymnax.environments import spaces
+from jax import numpy as jnp
+from jax.custom_batching import custom_vmap
+
+ROOT = Path(__file__).with_name("arcgpu")
+LIBRARY = ROOT / "build/libarcgpu_ffi.so"
+NUM_COLORS = 16
+_METADATA = json.loads((ROOT / "training/arcjax/game_meta.json").read_text())["games"]
+ARC_GAMES = {name: meta for name, meta in _METADATA.items() if not meta["has_click"] and 6 not in meta["actions"]}
+PROCEDURAL = tuple(name for name, meta in ARC_GAMES.items() if meta.get("procedural"))
+OFFICIAL = tuple(name for name in ARC_GAMES if name not in PROCEDURAL)
+TRAIN = ("wk01", "dr02", "g014", "g001")
+HOLDOUT = tuple(name for name in PROCEDURAL if name not in TRAIN)
+_LIB = None
+
+
+class State(NamedTuple):
+    steps: jax.Array
+    score: jax.Array
+    obs: jax.Array
+
+
+def _batched_call(target, attrs, output_dtypes, trailing_shapes, input_dims=0, masked=False):
+    @custom_vmap
+    def call(*args):
+        shape = args[0].shape[:args[0].ndim - input_dims]
+        n = math.prod(shape)
+        inputs = [x.reshape((n,) + x.shape[len(shape):]) for x in args]
+        outputs = [jax.ShapeDtypeStruct((n,) + tail, dtype) for tail, dtype in zip(trailing_shapes, output_dtypes)]
+        def run():
+            return tuple(jax.ffi.ffi_call(target, outputs, has_side_effect=True)(*inputs, **attrs))
+        result = jax.lax.cond(jnp.any(inputs[0]), run, lambda: (inputs[1],)) if masked else run()
+        return tuple(x.reshape(shape + tail) for x, tail in zip(result, trailing_shapes))
+
+    @call.def_vmap
+    def batch(size, batched, *args):
+        args = [x if b else jnp.broadcast_to(x, (size,) + x.shape) for x, b in zip(args, batched)]
+        out = call(*args)
+        return out, (True,) * len(out)
+
+    return call
+
+
+class Arc:
+    def __init__(self, game):
+        if game not in ARC_GAMES:
+            raise ValueError(f"{game!r} is not a supported no-click ARC game")
+        self.game = game
+        self.meta = ARC_GAMES[game]
+        self.num_actions = len(self.meta["actions"])
+        self._raw = self._reset = None
+
+    def observation_space(self, params=None):
+        return spaces.Box(0, NUM_COLORS - 1, (64, 64, 1), jnp.uint8)
+
+    def action_space(self, params=None):
+        return spaces.Discrete(self.num_actions)
+
+    def prepare(self, num_envs, agents=1, seed=0):
+        global _LIB
+        if self._raw is not None:
+            raise RuntimeError("Create a new Arc object for a new simulator batch")
+        if jax.local_devices()[0].platform != "gpu":
+            raise RuntimeError("arcgpu needs an NVIDIA GPU; metadata and replay tests can run on CPU")
+        if _LIB is None:
+            subprocess.run(["bash", str(ROOT / "bindings/jax/build_ffi.sh")], cwd=ROOT, check=True)
+            _LIB = ctypes.CDLL(str(LIBRARY))
+            for name, symbol in (("tinydisco_arc_step", "TinydiscoArcStep"), ("tinydisco_arc_reset", "TinydiscoArcReset")):
+                jax.ffi.register_ffi_target(name, jax.ffi.pycapsule(getattr(_LIB, symbol)), platform="CUDA")
+            _LIB.arcgpu_prewarm2.argtypes = [ctypes.c_char_p, ctypes.c_long, ctypes.c_int, ctypes.c_long,
+                                            ctypes.c_longlong, ctypes.c_long, ctypes.c_char_p, ctypes.c_long]
+            _LIB.arcgpu_prewarm2.restype = ctypes.c_int
+        attrs = dict(games=self.game, envs_per_game=num_envs, copies=agents, seed=seed, opts=1)
+        error = ctypes.create_string_buffer(1024)
+        if _LIB.arcgpu_prewarm2(self.game.encode(), num_envs, 0, agents, seed, 1, error, len(error)):
+            raise RuntimeError(error.value.decode())
+        # Flatten both vmap axes (agents and environments) into one CUDA call.
+        self._raw = _batched_call("tinydisco_arc_step", attrs, (jnp.int8, jnp.float32, jnp.uint8, jnp.uint8), ((64, 64), (), (), ()), input_dims=1)
+        self._reset = _batched_call("tinydisco_arc_reset", attrs, (jnp.uint8,), ((64, 64, 1),), masked=True)
+
+    def reset_where(self, state, mask):
+        if self._reset is None:
+            raise RuntimeError("Call Arc.prepare(num_envs, agents, seed) before stepping")
+        obs, = self._reset(mask.astype(jnp.uint8), state.obs)
+        return obs, State(jnp.where(mask, 0, state.steps), jnp.where(mask, 0, state.score), obs)
+
+    def reset(self, key, params=None):
+        state = State(jnp.int32(0), jnp.int32(0), jnp.zeros((64, 64, 1), jnp.uint8))
+        # Keep the key's vmap axes even though the engine owns the seeded PRNG.
+        return self.reset_where(state, jax.random.key_data(key)[0] >= jnp.uint32(0))
+
+    def step(self, key, state, action, params=None):
+        # Only declared keyboard actions are exposed; reset is controlled by the wrapper.
+        rows = jnp.stack((action, jnp.zeros_like(action), jnp.zeros_like(action), jnp.zeros_like(action)), -1).astype(jnp.uint8)
+        frame, _, flags, levels = self._raw(rows, state.obs)
+        obs = frame.astype(jnp.uint8)[..., None]
+        score = jnp.maximum(state.score, levels.astype(jnp.int32))
+        reward = (score - state.score).astype(jnp.float32)
+        steps = jnp.where(score > state.score, 0, state.steps + 1)
+        budgets = jnp.asarray(self.meta["budget_steps"], jnp.int32)
+        done = ((flags & 7) != 0) | (steps >= budgets[jnp.minimum(score, len(budgets) - 1)])
+        new = State(steps, score, obs)
+        next_obs, new = self.reset_where(new, done)
+        return next_obs, new, reward, done, {"score": score.astype(jnp.float32), "final_observation": obs}
