@@ -7,7 +7,7 @@
 Names: 'Chain-<variant>' (envs.chain.CHAINS), 'Grid-<variant>' or 'Grid-<variant>-collect' for the 18-action set (envs.grid.GRIDS),
 Craftax names such as 'Craftax-Classic-Pixels-v1', 'Atari-<game>' with a jaxtari game (envs.atari.TRAIN, HOLDOUT),
 'Arc-<game>' with a no-click arcgpu game (call env.prepare(num_envs, agents, seed) before compiling),
-and gymnax names such as 'Asterix-MinAtar'. ARC uses stateful CUDA calls; other environments are pure JAX.
+and gymnax names such as 'Asterix-MinAtar'. ARC uses stateful native calls; other environments are pure JAX.
 env.num_actions, env.observation_space(params) and env.action_space(params) work for all of them.
 Observations are uint8 (0-255 for [0, 1]); the models scale them back.
 """

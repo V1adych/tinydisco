@@ -1,10 +1,10 @@
 [project]
-name = "meta-rl"
+name = "tinydisco"
 version = "0.1.0"
 requires-python = "==3.12.*" # the python of ubuntu 24.04, so uv needs no download on the instance
 dependencies = [
+    "arcgpu",
     "jax>=0.11.2",
-    "jax[cuda12]>=0.11.2; sys_platform == 'linux'", # CUDA wheels exist only for linux
     "flax>=0.12.10",
     "optax>=0.2.8",
     "tyro>=1.0.16",
@@ -17,6 +17,15 @@ dependencies = [
     "ipywidgets>=8.1.9",
     "jaxtari>=0.2.0",
 ]
+
+[project.optional-dependencies]
+gpu = ["jax[cuda12]>=0.11.2; sys_platform == 'linux'"]
+
+[tool.uv.sources]
+arcgpu = { path = "src/modules/envs/arc/arcgpu", editable = true }
+
+[tool.uv.extra-build-dependencies]
+arcgpu = [{ requirement = "jax", match-runtime = true }, { requirement = "jaxlib", match-runtime = true }]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

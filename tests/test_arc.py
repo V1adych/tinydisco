@@ -1,4 +1,4 @@
-"""Metadata/compilation checks on CPU; real simulator checks run on CUDA."""
+"""Real CPU/CUDA simulator checks, plus batching and gradient tracing."""
 
 import jax
 import numpy as np
@@ -36,38 +36,28 @@ def _ffi_calls(jaxpr):
 
 
 def test_nested_vmap_scan_and_grad_keep_one_batched_step():
-    # Trace the real FFI contract on CPU. This cannot check native execution.
-    raw = arc._batched_call("tinydisco_arc_step", dict(games="wk01", envs_per_game=3, copies=2, seed=0, opts=1),
-                            (jnp.int8, jnp.float32, jnp.uint8, jnp.uint8), ((64, 64), (), (), ()), input_dims=1)
+    env, _ = make("Arc-wk01")
+    env.prepare(num_envs=3, agents=2, seed=891)
+    keys = jax.random.split(jax.random.key(0), 6).reshape(2, 3)
+    previous, _ = jax.jit(jax.vmap(jax.vmap(env.reset)))(keys)
+    raw = jax.vmap(jax.vmap(env.pool.step))
 
     def loss(weight, rows, previous):
-        def step(total, _):
-            _, reward, _, _ = jax.vmap(jax.vmap(raw))(rows, previous)
-            return total + weight * reward.sum(), None
-        return jax.lax.scan(step, 0.0, None, length=4)[0]
+        def step(carry, _):
+            total, previous = carry
+            frame, reward, _, _ = raw(rows, previous)
+            return (total + weight * reward.sum(), frame.astype(jnp.uint8)[..., None]), None
+        return jax.lax.scan(step, (0.0, previous), None, length=4)[0][0]
 
     rows = jnp.zeros((2, 3, 4), jnp.uint8)
-    traced = jax.make_jaxpr(jax.grad(loss))(1.0, rows, jnp.zeros((2, 3, 64, 64, 1), jnp.uint8))
+    traced = jax.make_jaxpr(jax.grad(loss))(1.0, rows, previous)
     calls = list(_ffi_calls(traced.jaxpr))
     assert len(calls) == 1
-    assert calls[0].invars[0].aval.shape == (6, 4)
+    assert calls[0].invars[0].aval.shape == (2, 3, 4)
     assert calls[0].params["has_side_effect"]
+    assert jnp.isfinite(jax.jit(jax.grad(loss))(1.0, rows, previous))
 
 
-def test_masked_reset_batches_before_testing_any():
-    reset = arc._batched_call("tinydisco_arc_reset", dict(games="wk01", envs_per_game=3, copies=2, seed=0, opts=1),
-                              (jnp.uint8,), ((64, 64, 1),), masked=True)
-    fn = jax.vmap(jax.vmap(reset))
-    mask = jnp.zeros((2, 3), jnp.uint8)
-    obs = jnp.zeros((2, 3, 64, 64, 1), jnp.uint8)
-    traced = jax.make_jaxpr(fn)(mask, obs)
-    calls = list(_ffi_calls(traced.jaxpr))
-    assert len(calls) == 1
-    assert [v.aval.shape for v in calls[0].invars] == [(6,), (6, 64, 64, 1)]
-    assert jax.eval_shape(fn, mask, obs)[0].shape == obs.shape
-
-
-@pytest.mark.skipif(jax.local_devices()[0].platform != "gpu", reason="arcgpu requires CUDA")
 def test_simulator_diversity_masked_resets_and_rollouts():
     env, _ = make("Arc-wk01")
     env.prepare(num_envs=4, agents=2, seed=9876)
@@ -89,6 +79,8 @@ def test_simulator_diversity_masked_resets_and_rollouts():
     total = jnp.zeros((2, 4))
     ended = False
     for i in range(120):
+        if i == 60:  # Exercise truncation without relying on a random policy reaching WIN.
+            state = state._replace(steps=jnp.full_like(state.steps, max(env.meta["budget_steps"])))
         action = jax.random.randint(jax.random.key(i), (2, 4), 0, env.num_actions)
         obs, state, reward, done, info = step(keys, state, action)
         total += reward

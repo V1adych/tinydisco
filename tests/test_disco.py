@@ -5,7 +5,6 @@ from dataclasses import replace
 from functools import partial
 
 import jax
-import pytest
 from flax import nnx
 from jax import numpy as jnp
 
@@ -81,7 +80,6 @@ def test_critic_learns_without_changing_actor_features():
     assert any(jnp.any(g != 0) for g in jax.tree.leaves(critic_grad)), "the critic head must receive gradients"
 
 
-@pytest.mark.skipif(jax.local_devices()[0].platform != "gpu", reason="arcgpu requires CUDA")
 def test_meta_steps_run():
     """Two games with different action counts and observation shapes, tiny sizes, two meta steps: the meta-network must
     change and stay finite."""

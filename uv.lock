@@ -73,6 +73,17 @@ wheels = [
 ]
 
 [[package]]
+name = "arcgpu"
+version = "0.1.0"
+source = { editable = "src/modules/envs/arc/arcgpu" }
+dependencies = [
+    { name = "jax" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "jax", specifier = ">=0.11.2" }]
+
+[[package]]
 name = "asttokens"
 version = "3.0.2"
 source = { registry = "https://pypi.org/simple" }
@@ -814,43 +825,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/d6/54/cfe61301667036ec958cb99bd3efefba235e65cdeb9c84d24a8293ba1d90/mdurl-0.1.2.tar.gz", hash = "sha256:bb413d29f5eea38f31dd4754dd7377d4465116fb207585f97bf925588687c1ba", size = 8729, upload-time = "2022-08-14T12:40:10.846Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b3/38/89ba8ad64ae25be8de66a6d463314cf1eb366222074cfda9ee839c56a4b4/mdurl-0.1.2-py3-none-any.whl", hash = "sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8", size = 9979, upload-time = "2022-08-14T12:40:09.779Z" },
-]
-
-[[package]]
-name = "meta-rl"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "craftax" },
-    { name = "flax" },
-    { name = "gymnax" },
-    { name = "ipykernel" },
-    { name = "ipywidgets" },
-    { name = "jax" },
-    { name = "jax", extra = ["cuda12"], marker = "sys_platform == 'linux'" },
-    { name = "jaxtari" },
-    { name = "optax" },
-    { name = "orbax-checkpoint" },
-    { name = "pytest" },
-    { name = "tyro" },
-    { name = "wandb" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "craftax", specifier = ">=1.6.1" },
-    { name = "flax", specifier = ">=0.12.10" },
-    { name = "gymnax", specifier = ">=1.0.1" },
-    { name = "ipykernel", specifier = ">=7.4.0" },
-    { name = "ipywidgets", specifier = ">=8.1.9" },
-    { name = "jax", specifier = ">=0.11.2" },
-    { name = "jax", extras = ["cuda12"], marker = "sys_platform == 'linux'", specifier = ">=0.11.2" },
-    { name = "jaxtari", specifier = ">=0.2.0" },
-    { name = "optax", specifier = ">=0.2.8" },
-    { name = "orbax-checkpoint" },
-    { name = "pytest", specifier = ">=9.1.1" },
-    { name = "tyro", specifier = ">=1.0.16" },
-    { name = "wandb", specifier = ">=0.30.0" },
 ]
 
 [[package]]
@@ -1675,6 +1649,50 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/78/49/c311f02b82299c6d79e18c7012c8b816141c54721253cbcba1c7c59550d4/tensorstore-0.1.85-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:de27f2d6e063050f4283d1fdfe41e6c0ebc6ceacaab10ca2f7e9ecbf35221962", size = 21580735, upload-time = "2026-08-05T15:35:11.727Z" },
     { url = "https://files.pythonhosted.org/packages/88/da/3d66562291808e1edd433704bfdd4f212c1a6c53920293fb5f7296d644a5/tensorstore-0.1.85-cp312-cp312-win_amd64.whl", hash = "sha256:a5421480cd6ab144039c88fc7018ea5cefb8d00038e6dd2470cf776ef1bf45a5", size = 14129526, upload-time = "2026-08-05T15:35:14.98Z" },
 ]
+
+[[package]]
+name = "tinydisco"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "arcgpu" },
+    { name = "craftax" },
+    { name = "flax" },
+    { name = "gymnax" },
+    { name = "ipykernel" },
+    { name = "ipywidgets" },
+    { name = "jax" },
+    { name = "jaxtari" },
+    { name = "optax" },
+    { name = "orbax-checkpoint" },
+    { name = "pytest" },
+    { name = "tyro" },
+    { name = "wandb" },
+]
+
+[package.optional-dependencies]
+gpu = [
+    { name = "jax", extra = ["cuda12"], marker = "sys_platform == 'linux'" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "arcgpu", editable = "src/modules/envs/arc/arcgpu" },
+    { name = "craftax", specifier = ">=1.6.1" },
+    { name = "flax", specifier = ">=0.12.10" },
+    { name = "gymnax", specifier = ">=1.0.1" },
+    { name = "ipykernel", specifier = ">=7.4.0" },
+    { name = "ipywidgets", specifier = ">=8.1.9" },
+    { name = "jax", specifier = ">=0.11.2" },
+    { name = "jax", extras = ["cuda12"], marker = "sys_platform == 'linux' and extra == 'gpu'", specifier = ">=0.11.2" },
+    { name = "jaxtari", specifier = ">=0.2.0" },
+    { name = "optax", specifier = ">=0.2.8" },
+    { name = "orbax-checkpoint" },
+    { name = "pytest", specifier = ">=9.1.1" },
+    { name = "tyro", specifier = ">=1.0.16" },
+    { name = "wandb", specifier = ">=0.30.0" },
+]
+provides-extras = ["gpu"]
 
 [[package]]
 name = "toolz"
