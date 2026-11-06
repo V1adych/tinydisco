@@ -11,7 +11,7 @@ from jaxtari.modification import apply_native_downscaling
 from jaxtari.wrappers import AtariState, AtariWrapper
 
 # Yars Revenge and Kaboom replace Beamrider and Seaquest for cheaper updates with accessible reward.
-TRAIN = ("asterix", "asteroids", "mspacman", "yarsrevenge", "frostbite", "gopher", "kangaroo", "kaboom", "flag-capture", "amidar")
+TRAIN = ("asterix", "asteroids", "mspacman", "yarsrevenge", "frostbite", "gopher", "kangaroo", "kaboom", "amidar")
 HOLDOUT = ("breakout", "pong", "boxing")
 SIZE, FRAME_SKIP = 84, 4
 
