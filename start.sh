@@ -22,12 +22,12 @@ mkdir -p ~/.ssh
 chown root:root ~ ~/.ssh ~/.ssh/authorized_keys 2> /dev/null
 chmod go-w ~ && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys 2> /dev/null
 
-# Repo access: a read-only deploy key, base64-encoded in GITHUB_DEPLOY_KEY
-echo "$GITHUB_DEPLOY_KEY" | base64 -d > ~/.ssh/id_ed25519
+# Repo access: a read-only deploy key, base64-encoded in TINYDISCO_DEPLOY_KEY
+echo "$TINYDISCO_DEPLOY_KEY" | base64 -d > ~/.ssh/id_ed25519
 chmod 600 ~/.ssh/id_ed25519
 # trust github.com's host key, since nobody is there to answer ssh's "are you sure?" prompt
 ssh-keyscan github.com >> ~/.ssh/known_hosts 2> /dev/null
-git clone git@github.com:V1adych/meta-rl.git /root/meta-rl
+git clone git@github.com:V1adych/tinydisco.git /root/meta-rl
 cd /root/meta-rl
 if [ -n "$ARCGPU_DEPLOY_KEY" ]; then
     echo "$ARCGPU_DEPLOY_KEY" | base64 -d > ~/.ssh/arcgpu

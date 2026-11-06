@@ -3,7 +3,7 @@
 PROVIDER=vast (default) rents the cheapest acceptable Vast.ai offer; PROVIDER=runpod a RunPod pod (CLOUD=SECURE when community is out of stock).
 GPU names the card in the provider's own naming, e.g. GPU="RTX 5090" or GPU="NVIDIA GeForce RTX 5090".
 DISK_GB=30 and MIN_RAM_GIB=16 set disk space and minimum host RAM.
-Needs WANDB_API_KEY, GITHUB_DEPLOY_KEY (base64) and the provider's VASTAI_API_KEY or RUNPOD_API_KEY in the environment. ARCGPU_DEPLOY_KEY (base64) is needed if the main key cannot also read V1adych/arcgpu."""
+Needs WANDB_API_KEY, TINYDISCO_DEPLOY_KEY (base64) and the provider's VASTAI_API_KEY or RUNPOD_API_KEY in the environment. ARCGPU_DEPLOY_KEY (base64) is needed if the main key cannot also read V1adych/arcgpu."""
 
 import json
 import os
@@ -20,7 +20,7 @@ MIN_RAM_GIB = int(os.environ.get("MIN_RAM_GIB", "64"))
 VASTAI_API_KEY = os.environ.get("VASTAI_API_KEY")
 RUNPOD_API_KEY = os.environ.get("RUNPOD_API_KEY")
 WANDB_API_KEY = os.environ.get("WANDB_API_KEY")
-GITHUB_DEPLOY_KEY = os.environ.get("GITHUB_DEPLOY_KEY")
+TINYDISCO_DEPLOY_KEY = os.environ.get("TINYDISCO_DEPLOY_KEY")
 ARCGPU_DEPLOY_KEY = os.environ.get("ARCGPU_DEPLOY_KEY")  # optional separate read-only key for the private submodule
 # Vast: verified, reliable hosts with a fast link and enough cores for XLA's compile; hosts in China could not download our dependencies
 VAST_OFFER_FILTER = {
@@ -90,8 +90,8 @@ def runpod(script: str, env: dict):
 
 
 if __name__ == "__main__":  # importing this module must not rent anything
-    assert WANDB_API_KEY and GITHUB_DEPLOY_KEY, "WANDB_API_KEY and GITHUB_DEPLOY_KEY are required"
-    env = {"WANDB_API_KEY": WANDB_API_KEY, "GITHUB_DEPLOY_KEY": GITHUB_DEPLOY_KEY, "RUN_COMMAND": " ".join(sys.argv[1:])}
+    assert WANDB_API_KEY and TINYDISCO_DEPLOY_KEY, "WANDB_API_KEY and TINYDISCO_DEPLOY_KEY are required"
+    env = {"WANDB_API_KEY": WANDB_API_KEY, "TINYDISCO_DEPLOY_KEY": TINYDISCO_DEPLOY_KEY, "RUN_COMMAND": " ".join(sys.argv[1:])}
     if ARCGPU_DEPLOY_KEY:
         env["ARCGPU_DEPLOY_KEY"] = ARCGPU_DEPLOY_KEY
     print({"vast": vast, "runpod": runpod}[PROVIDER](Path("start.sh").read_text(), env))
