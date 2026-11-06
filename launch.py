@@ -83,7 +83,10 @@ def runpod(script: str, env: dict):
         "disk": DISK_GB,
         "env": env,
     }
-    return call("https://api.runpod.io/v2/pods", RUNPOD_API_KEY, body)
+    result = call("https://api.runpod.io/v2/pods", RUNPOD_API_KEY, body)
+    if not result.get("id"):
+        sys.exit("RunPod did not return a pod ID; check the provider dashboard for the launch status")
+    return f"instance {result['id']}: {GPU} in {result.get('dataCenterId', 'unknown location')} at ${result['cost']:.3f}/h ({CLOUD})"
 
 
 if __name__ == "__main__":  # importing this module must not rent anything
