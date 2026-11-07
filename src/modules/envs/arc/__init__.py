@@ -5,6 +5,7 @@ vmap adds to that batch; never rematerialize an environment call or branch/fork
 its state. Hard resets draw fresh curricula from the engine's seeded generator.
 """
 
+from pathlib import Path
 from typing import NamedTuple
 
 import arcgpu
@@ -17,7 +18,7 @@ _METADATA = arcgpu.GAMES
 ARC_GAMES = {name: meta for name, meta in _METADATA.items() if not meta["has_click"] and 6 not in meta["actions"]}
 PROCEDURAL = tuple(name for name, meta in ARC_GAMES.items() if meta.get("procedural"))
 OFFICIAL = tuple(name for name in ARC_GAMES if name not in PROCEDURAL)
-TRAIN = ("wk01", "dr02", "g014", "g001", "g003", "g006", "g016", "g021", "g022", "g025", "g038", "g051")
+TRAIN = tuple(Path(__file__).with_name("train.txt").read_text().split())
 HOLDOUT = tuple(name for name in PROCEDURAL if name not in TRAIN)
 
 

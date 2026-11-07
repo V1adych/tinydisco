@@ -5,6 +5,7 @@ GPU names the card in the provider's own naming, e.g. GPU="RTX 5090" or GPU="NVI
 DISK_GB=30 and MIN_RAM_GIB=16 set disk space and minimum host RAM.
 Needs WANDB_API_KEY, TINYDISCO_DEPLOY_KEY (base64) and the provider's VASTAI_API_KEY or RUNPOD_API_KEY in the environment. ARCGPU_DEPLOY_KEY (base64) is needed if the main key cannot also read V1adych/arcgpu."""
 
+import argparse
 import json
 import os
 import sys
@@ -57,6 +58,19 @@ def vast_ram_gib(offer: dict) -> float:
     return (offer.get("cpu_ram") or 0) / 1024 * (offer.get("cpu_cores_effective") or 0) / offer["cpu_cores"]
 
 
+def arc_build_games(command: list[str]) -> str | None:
+    """Match Disco's --games, or its shared default ARC list, before dependencies are installed."""
+    if not any(Path(arg).name == "disco.py" or arg == "scripts.disco" for arg in command):
+        return None
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument("--games", nargs="+")
+    args, _ = parser.parse_known_args(command)
+    games = (Path(__file__).parent / "src/modules/envs/arc/train.txt").read_text().split() if args.games is None else [
+        name.removeprefix("Arc-") for name in args.games if name.startswith("Arc-")
+    ]
+    return " ".join(dict.fromkeys(games))
+
+
 def vast(script: str, env: dict):
     assert VASTAI_API_KEY, "VASTAI_API_KEY is required"
     offers = call("https://console.vast.ai/api/v0/bundles/", VASTAI_API_KEY, VAST_OFFER_FILTER | {"gpu_name": {"eq": GPU}})["offers"]
@@ -94,4 +108,8 @@ if __name__ == "__main__":  # importing this module must not rent anything
     env = {"WANDB_API_KEY": WANDB_API_KEY, "TINYDISCO_DEPLOY_KEY": TINYDISCO_DEPLOY_KEY, "RUN_COMMAND": " ".join(sys.argv[1:])}
     if ARCGPU_DEPLOY_KEY:
         env["ARCGPU_DEPLOY_KEY"] = ARCGPU_DEPLOY_KEY
+    games = arc_build_games(sys.argv[1:])
+    if games is not None:
+        env["ARC_BUILD_GAMES"] = games
+        print(f"ARC build: {games or '(no ARC games)'}")
     print({"vast": vast, "runpod": runpod}[PROVIDER](Path("start.sh").read_text(), env))

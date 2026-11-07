@@ -37,3 +37,6 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 exclude = ["modules.envs.arc.arcgpu*"]
+
+[tool.setuptools.package-data]
+"modules.envs.arc" = ["train.txt"]

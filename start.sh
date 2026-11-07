@@ -45,8 +45,8 @@ else
 fi
 git submodule update --init src/modules/envs/arc/arcgpu || exit 1
 uv sync --frozen --extra gpu --config-settings-package arcgpu:backend=cuda || exit 1
-# Use JAX's pip CUDA libraries, not the image's older toolkit libraries.
-unset LD_LIBRARY_PATH
+# Prefer host drivers over CUDA compatibility stubs; JAX supplies its own toolkit libraries.
+export LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/lib/x86_64-linux-gnu
 # jaxtari's sprite pack; the owner confirmed owning the Atari 2600 ROMs
 JAXTARI_CONFIRM_OWNERSHIP=1 uv run --no-sync install-sprites
 env >> /etc/environment  # so that an ssh session sees the same variables as this script
@@ -61,6 +61,8 @@ fi
 export PYTHONUNBUFFERED=1
 export JAX_LOG_COMPILES=1
 export JAX_COMPILATION_CACHE_DIR=~/jax_cache
+# arcgpu allocates CUDA memory outside JAX's pool.
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
 # e.g. python launch.py python src/scripts/disco.py --track
 uv run --no-sync $RUN_COMMAND
