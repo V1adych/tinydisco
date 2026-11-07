@@ -1,5 +1,4 @@
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, NamedTuple
@@ -460,11 +459,9 @@ def train(cfg: Config, specs: dict[str, Spec] = SPECS):
         f"{run_name}: meta-network {num_params(nnx.merge(meta_graphdef, meta_params)):,} params, {len(games)} games x {per_game} agents, {steps_per_meta_step:,} env steps per meta step"
     )
 
-    # compiled ahead, on the state's shapes before the state exists (so that cudnn's autotuning has the whole GPU), in
-    # threads: XLA releases the GIL while compiling, so the games' programs compile side by side
+    # Compile before allocating training state; keep each game's autotuning isolated.
     shapes = jax.eval_shape(init_state)
-    with ThreadPoolExecutor() as pool:
-        steps = list(pool.map(lambda g: game_step(g).lower(meta_params, shapes[0][g], shapes[1][g], shapes[2][g], key).compile(), range(len(games))))
+    steps = [game_step(g).lower(meta_params, shapes[0][g], shapes[1][g], shapes[2][g], key).compile() for g in range(len(games))]
     m = [step.memory_analysis() for step in steps]
     print(
         f"meta step memory: device inputs {sum(x.argument_size_in_bytes for x in m) / 2**30:.2f} GiB, "
