@@ -60,7 +60,7 @@ def vast_ram_gib(offer: dict) -> float:
 def vast(script: str, env: dict):
     assert VASTAI_API_KEY, "VASTAI_API_KEY is required"
     offers = call("https://console.vast.ai/api/v0/bundles/", VASTAI_API_KEY, VAST_OFFER_FILTER | {"gpu_name": {"eq": GPU}})["offers"]
-    body = {"image": IMAGE, "disk": DISK_GB, "runtype": "ssh", "label": "meta-rl", "onstart": script, "env": env}
+    body = {"image": IMAGE, "disk": DISK_GB, "runtype": "ssh", "label": "disco", "onstart": script, "env": env}
     for offer in offers:  # listings go stale within minutes, so the first offer may already be gone
         if "CN" in str(offer.get("geolocation")) or vast_ram_gib(offer) < MIN_RAM_GIB:
             continue
@@ -74,7 +74,7 @@ def vast(script: str, env: dict):
 def runpod(script: str, env: dict):
     assert RUNPOD_API_KEY, "RUNPOD_API_KEY is required"
     body = {
-        "name": "meta-rl",
+        "name": "disco",
         "cloud": CLOUD,
         "gpu": {"id": GPU, "count": 1, "minCudaVersion": "12.8", "minRamPerGpu": MIN_RAM_GIB},
         "image": IMAGE,

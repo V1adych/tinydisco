@@ -44,7 +44,7 @@ class Config:
     checkpoint_dir: str = "checkpoints"
     resume: str | None = None  # continue from a checkpoint directory or wandb artifact at its step; optimizer state starts fresh
     track: bool = False
-    wandb_project: str = "meta-rl"
+    wandb_project: str = "ppo"
     run_name: str | None = None
 
     @property

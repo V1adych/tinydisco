@@ -1,6 +1,3 @@
-"""General pieces of meta-RL: distribution helpers, off-policy return estimators, and the optimizer and gradient that
-a meta-gradient differentiates through."""
-
 import jax
 import optax
 from jax import numpy as jnp

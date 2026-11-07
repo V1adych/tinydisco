@@ -14,8 +14,6 @@ def save_checkpoint(directory: str, step: int, model: nnx.Module) -> Path:
 
 
 def fetch_checkpoint(name: str) -> tuple[Path, int]:
-    """A local checkpoint directory, or a wandb artifact such as 'v1adych-team/meta-rl/meta_baseline:v2' downloaded, with the step it was saved at:
-    the directory name for a local one, the step-N alias for an artifact."""
     if Path(name).exists():
         return Path(name), int(Path(name).name)
     artifact = wandb.Api().artifact(name, type="model")

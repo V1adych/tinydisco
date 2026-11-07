@@ -27,8 +27,8 @@ echo "$TINYDISCO_DEPLOY_KEY" | base64 -d > ~/.ssh/id_ed25519
 chmod 600 ~/.ssh/id_ed25519
 # trust github.com's host key, since nobody is there to answer ssh's "are you sure?" prompt
 ssh-keyscan github.com >> ~/.ssh/known_hosts 2> /dev/null
-git clone git@github.com:V1adych/tinydisco.git /root/meta-rl
-cd /root/meta-rl
+git clone git@github.com:V1adych/tinydisco.git /root/tinydisco
+cd /root/tinydisco
 if [ -n "$ARCGPU_DEPLOY_KEY" ]; then
     echo "$ARCGPU_DEPLOY_KEY" | base64 -d > ~/.ssh/arcgpu
     chmod 600 ~/.ssh/arcgpu
@@ -45,6 +45,8 @@ else
 fi
 git submodule update --init src/modules/envs/arc/arcgpu || exit 1
 uv sync --frozen --extra gpu --config-settings-package arcgpu:backend=cuda || exit 1
+# Use JAX's pip CUDA libraries, not the image's older toolkit libraries.
+unset LD_LIBRARY_PATH
 # jaxtari's sprite pack; the owner confirmed owning the Atari 2600 ROMs
 JAXTARI_CONFIRM_OWNERSHIP=1 uv run --no-sync install-sprites
 env >> /etc/environment  # so that an ssh session sees the same variables as this script
